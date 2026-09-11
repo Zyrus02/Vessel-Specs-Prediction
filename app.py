@@ -293,13 +293,38 @@ def mechanical_page():
         # Sort from most similar (smallest distance) to least similar
         ranked = ranked.sort_values('distance').reset_index(drop=True)
 
+        # ==========================================================
+        # AUTO-BRACKETING ALGORITHM (MECHANICAL)
+        # ==========================================================
+        best_idx_1 = 0  # Always take the absolute closest physical match
+        best_idx_2 = 1  # Default fallback if a bracket cannot be found
+        
+        if len(ranked) > 1:
+            vol_1 = ranked.iloc[best_idx_1]['volume_m3']
+            # Scan the list to find the next closest vessel that brackets the query
+            for i in range(1, len(ranked)):
+                vol_i = ranked.iloc[i]['volume_m3']
+                # If one volume is smaller than the query and the other is larger, it's a bracket!
+                if (vol_1 <= query_volume <= vol_i) or (vol_i <= query_volume <= vol_1):
+                    best_idx_2 = i
+                    break  # Stop searching once we find the perfect bracket
+
+        default_selections = [best_idx_1, best_idx_2] if len(ranked) > 1 else [0]
+        # ==========================================================
+
         def _label(i):
             r = ranked.iloc[i]
             return (f"{r['equip_no']} — Vol {r['volume_m3']:.2f} m³, Area {r['area_m2']:.2f} m², Cost {r['unit_cost_num']:,.0f} MYR (Dist {r['distance']:.3f})")
 
         st.markdown("**Reference vessels for interpolation**")
-        # Let the user choose which of the top matches to use (defaults to the best 2)
-        selected_idx = st.multiselect("Choose exactly 2 reference vessels:", options=list(range(len(ranked))), default=[0, 1], format_func=_label, max_selections=2)
+        # The multiselect now auto-selects bracketing values if possible
+        selected_idx = st.multiselect(
+            "Choose exactly 2 reference vessels (auto-selects bracketing values if possible):", 
+            options=list(range(len(ranked))), 
+            default=default_selections, 
+            format_func=_label, 
+            max_selections=2
+        )
 
         if len(selected_idx) != 2:
             st.info("Select exactly 2 reference vessels above to view predictions.")
@@ -430,7 +455,7 @@ def mechanical_page():
                 ]
             }
             st.table(pd.DataFrame(detail_data))
-            
+
         # =================================================================
         # NEW SECTION: Historical Project & Reference Details
         # =================================================================
@@ -507,8 +532,28 @@ def piping_page():
         # Sort so the closest sizes are at the top. If there's a tie, put the newest 'year' at the top
         filtered = filtered.sort_values(['size_diff', 'year'], ascending=[True, False])
         
-        # Grab exactly two distinct sizes (drop duplicates) to draw our interpolation line
-        closest_sizes = filtered.drop_duplicates(subset=['size_num']).head(2)
+        # Grab distinct sizes
+        unique_sizes = filtered.drop_duplicates(subset=['size_num']).reset_index(drop=True)
+        
+        # ==========================================================
+        # AUTO-BRACKETING ALGORITHM (PIPING)
+        # ==========================================================
+        if len(unique_sizes) >= 2:
+            best_idx_1 = 0
+            best_idx_2 = 1 # Fallback
+            size_1 = unique_sizes.iloc[best_idx_1]['size_num']
+            
+            for i in range(1, len(unique_sizes)):
+                size_i = unique_sizes.iloc[i]['size_num']
+                # If one size is smaller than the query and the other is larger, it's a bracket!
+                if (size_1 <= user_size <= size_i) or (size_i <= user_size <= size_1):
+                    best_idx_2 = i
+                    break
+                    
+            closest_sizes = unique_sizes.iloc[[best_idx_1, best_idx_2]]
+        else:
+            closest_sizes = unique_sizes.head(2)
+        # ==========================================================
 
         # 7C. CALCULATING PREDICTIONS
         if len(closest_sizes) < 2:
@@ -587,7 +632,7 @@ def piping_page():
 # This acts as a switchboard. It maps the names on the sidebar to the functions above.
 # =====================================================================
 PAGES = {
-    "Mechanical": mechanical_page, # Links to the Vessel predictor
+    "Mechanical (Vessel)": mechanical_page, # Links to the Vessel predictor
     "Piping": piping_page,         # Links to the Valve predictor
 }
 
