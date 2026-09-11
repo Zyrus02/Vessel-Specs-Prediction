@@ -1,14 +1,24 @@
-import re
-import math
-import numpy as np
-import pandas as pd
-import streamlit as st
+# =====================================================================
+# 1. IMPORTS & SETUP
+# These are the "toolboxes" the application uses to run.
+# =====================================================================
+import math              # Used for basic math like Pi (for circular geometry)
+import re                # 'Regular Expressions' - used to find numbers hidden inside text
+import numpy as np       # Used for advanced math, like calculating the "shape distance" (square roots, etc.)
+import pandas as pd      # The "accountant" tool. Reads Excel files and organizes data into tables (DataFrames)
+import streamlit as st   # The web builder. Turns this python script into an interactive website
+import matplotlib.pyplot as plt # The graphing tool used to draw the cost vs size charts
 
-st.set_page_config(page_title="Vessel Weight Predictor", page_icon="⚙️", layout="wide")
+# Sets up the web page title and tells it to use the full width of the screen
+st.set_page_config(page_title="Engineering Specs Predictor", page_icon="📐", layout="wide")
 
-# Column layout for the "Vessel Database (2)" sheet: same as the Rev1 template,
-# with two trailing columns (Volume, Area) added after Folder.
-# 3 header rows (category / sub-label / units), data starts on row 5.
+# A standard option we use in dropdown menus later
+AUTO_OPTION = "Auto (recommend from history)"
+
+# =====================================================================
+# 2. MECHANICAL (VESSELS) CONFIGURATION
+# Defines how to read the Vessel Excel sheet and what columns to expect.
+# =====================================================================
 COLUMN_NAMES = [
     'equip_no', 'qty', 'description', 'pfd_no', 'location', 'capacity',
     'duty_kw', 'absorbed_kw', 'design_press', 'design_temp_max', 'design_temp_min',
@@ -19,77 +29,65 @@ COLUMN_NAMES = [
 ]
 SHEET_NAME = 'Vessel Database (2)'
 
-# --- Required inputs: dimensions drive the geometry; design conditions kept for reference ---
+# Grouping columns together so it's easier to reference them later
 DIMENSION_FEATURES = ['length_num', 'diameter_num']
 DESIGN_CONDITION_FEATURES = ['design_press_num', 'design_temp_max_num', 'design_temp_min_num']
 CATEGORICAL_FEATURES = ['material_category', 'orientation_clean']
-
-# --- Outputs: weight only for now. Unit cost was removed — a leave-one-out
-# accuracy check showed the cost model (volume-based curve x material
-# factor) had a median error of ~70% and was unreliable, so it's disabled
-# until a better approach is found (see conversation for the diagnosis).
 WEIGHT_TARGETS = ['wt_unit_dry_num', 'wt_unit_oper_num', 'wt_test_num']
-TARGET_COLS = WEIGHT_TARGETS
+
 WEIGHT_LABELS = {
     'wt_unit_dry_num': 'Unit Dry',
     'wt_unit_oper_num': 'Unit Operating',
     'wt_test_num': 'Test',
 }
-
 REFERENCE_COLS = ['project', 'year']
-AUTO_OPTION = "Auto (recommend from history)"
-
+REQUIRED_COLS = DIMENSION_FEATURES + WEIGHT_TARGETS + ['unit_cost_num']
+DISPLAY_COLS = (['equip_no', 'description', 'length_num', 'diameter_num',
+                  'volume_m3', 'area_m2'] + DESIGN_CONDITION_FEATURES
+                 + CATEGORICAL_FEATURES + WEIGHT_TARGETS + ['unit_cost_num'] + REFERENCE_COLS)
 
 # =====================================================================
-# CLEANING HELPERS
+# 3. MECHANICAL DATA CLEANERS
+# Excel data is often messy. These functions clean the data so the computer can do math on it.
 # =====================================================================
 def first_num(x):
-    """Pull the first number out of a cell like '3,600 ' or '14000'."""
-    if pd.isna(x):
-        return None
-    s = str(x).replace(',', '')
-    m = re.search(r'-?\d+\.?\d*', s)
+    """Takes a messy cell like ' 1,500 kg ' and extracts just the number: 1500.0"""
+    if pd.isna(x): return None
+    s = str(x).replace(',', '') # Remove commas so thousands don't break the math
+    m = re.search(r'-?\d+\.?\d*', s) # Search for the first valid number
     return float(m.group()) if m else None
 
-
 def categorize_material(s):
-    """Keep the material text exactly as entered — only tidy whitespace/line breaks."""
-    if pd.isna(s) or str(s).strip() == '':
-        return 'Unknown'
-    s = str(s).strip()
-    s = re.sub(r'\s+', ' ', s)
-    return s
-
+    """Removes weird extra spaces so 'Carbon  Steel' becomes 'Carbon Steel'."""
+    if pd.isna(s) or str(s).strip() == '': return 'Unknown'
+    return re.sub(r'\s+', ' ', str(s).strip())
 
 def normalize_orientation(s):
-    if pd.isna(s):
-        return 'Unknown'
+    """Forces orientation to be either 'Vertical', 'Horizontal', or 'Unknown'."""
+    if pd.isna(s): return 'Unknown'
     s = str(s).strip().upper()
-    if s.startswith('V'):
-        return 'Vertical'
-    if s.startswith('H'):
-        return 'Horizontal'
+    if s.startswith('V'): return 'Vertical'
+    if s.startswith('H'): return 'Horizontal'
     return 'Unknown'
 
-
 def compute_geometry(length_mm, diameter_mm):
-    """Cylinder-with-flat-ends volume (m3) and surface area (m2) from length
-    and internal diameter in mm. Matches the workbook's Volume/Area columns
-    to within rounding, verified against the source data."""
-    L = length_mm / 1000.0
+    """Uses basic cylinder math to calculate Volume (m3) and Surface Area (m2)."""
+    L = length_mm / 1000.0 # Convert mm to meters
     D = diameter_mm / 1000.0
     volume = (math.pi / 4) * D ** 2 * L
     area = math.pi * D * L + (math.pi / 2) * D ** 2
     return volume, area
 
-
-@st.cache_data
+@st.cache_data # Tells Streamlit to remember this step so it doesn't reload the Excel file every time you click a button
 def load_and_clean(file):
+    """Loads the Mechanical Excel file and runs all the cleaning functions above on it."""
+    # Skip the first 4 rows because they are just titles/headers in your Excel file
     raw = pd.read_excel(file, sheet_name=SHEET_NAME, header=None, skiprows=4)
     raw = raw.iloc[:, 1:1 + len(COLUMN_NAMES)]
     raw.columns = COLUMN_NAMES
 
     df = raw.copy()
+    # Apply the 'first_num' cleaner to all numerical columns
     df['length_num'] = df['length_tt'].apply(first_num)
     df['diameter_num'] = df['diameter_id'].apply(first_num)
     df['design_press_num'] = df['design_press'].apply(first_num)
@@ -98,13 +96,13 @@ def load_and_clean(file):
     df['wt_unit_dry_num'] = df['wt_unit_dry'].apply(first_num)
     df['wt_unit_oper_num'] = df['wt_unit_oper'].apply(first_num)
     df['wt_test_num'] = df['wt_test'].apply(first_num)
-    df['unit_cost_num'] = df['unit_cost'].apply(first_num)  # kept for reference display only
+    df['unit_cost_num'] = df['unit_cost'].apply(first_num)
+    
+    # Apply text cleaners
     df['material_category'] = df['material'].apply(categorize_material)
     df['orientation_clean'] = df['orientation'].apply(normalize_orientation)
 
-    # Volume/Area are always (re)computed from length & diameter, rather than
-    # trusting the workbook's stored Volume/Area cells, since a few rows have
-    # those cells blank — this keeps every row usable and self-consistent.
+    # Calculate actual volume and area for every row in the historical database
     geo = df.apply(
         lambda r: compute_geometry(r['length_num'], r['diameter_num'])
         if pd.notna(r['length_num']) and pd.notna(r['diameter_num']) else (None, None),
@@ -115,227 +113,421 @@ def load_and_clean(file):
 
     return df
 
+# =====================================================================
+# 4. PIPING (VALVES) CONFIG & HELPERS
+# Similar to Mechanical, but tailored for the Valves Excel file.
+# =====================================================================
+VALVE_SHEET_NAME = 'OVERALL DATABASE'
+VALVE_COLUMNS = [
+    'item_no', 'year', 'project', 'valve_type', 'subtype', 'size_1_mm', 'size_2_mm',
+    'bore', 'rating', 'end_connection', 'material', 'unit_weight_kg', 'unit_cost_rm'
+]
 
-DISPLAY_COLS = (['equip_no', 'description', 'length_num', 'diameter_num',
-                  'volume_m3', 'area_m2'] + DESIGN_CONDITION_FEATURES
-                 + CATEGORICAL_FEATURES + WEIGHT_TARGETS + ['unit_cost_num'] + REFERENCE_COLS)
+def clean_valve_rating(val):
+    """Fixes inconsistencies in how ratings are typed (e.g. making 'API5000' standardized)."""
+    if pd.isna(val): return 'Unknown'
+    s = str(val).strip().upper()
+    return 'API 5000' if s == 'API5000' else s
 
-REQUIRED_COLS = DIMENSION_FEATURES + TARGET_COLS
+def clean_numeric(val):
+    """Cleans numbers, but also handles cases where cells just have a dash '-' meaning empty."""
+    if pd.isna(val) or str(val).strip() == '-': return None
+    s = str(val).replace(',', '')
+    m = re.search(r'-?\d+\.?\d*', s)
+    return float(m.group()) if m else None
 
+@st.cache_data
+def load_and_clean_valves(file):
+    """Loads and cleans the Valve Excel file."""
+    raw = pd.read_excel(file, sheet_name=VALVE_SHEET_NAME, header=2) # Headers start on row 3
+    raw.columns = VALVE_COLUMNS
+    
+    df = raw.copy()
+    df['size_num'] = df['size_1_mm'].apply(clean_numeric)
+    df['weight_num'] = df['unit_weight_kg'].apply(clean_numeric)
+    df['cost_num'] = df['unit_cost_rm'].apply(clean_numeric)
+    df['rating_clean'] = df['rating'].apply(clean_valve_rating)
+    df['type_clean'] = df['valve_type'].astype(str).str.strip().str.upper()
+    df['material_clean'] = df['material'].astype(str).str.strip().str.upper()
+    
+    # Throw away rows that are missing the size or cost, because we can't predict with them
+    return df.dropna(subset=['size_num', 'cost_num'])
 
-def interpolate(two_refs: pd.DataFrame, query_volume: float, target_col: str):
-    """Linear interpolation (or extrapolation, if the query volume falls
-    outside the 2 references' range) of target_col along the Volume axis."""
-    v_a, v_b = two_refs['volume_m3'].iloc[0], two_refs['volume_m3'].iloc[1]
-    t_a, t_b = two_refs[target_col].iloc[0], two_refs[target_col].iloc[1]
-    if v_b == v_a:
-        return (t_a + t_b) / 2, 0.5
-    frac = (query_volume - v_a) / (v_b - v_a)
+# =====================================================================
+# 5. SHARED MATH: LINEAR INTERPOLATION
+# The core prediction brain used by both Mechanical and Piping.
+# =====================================================================
+def interpolate_by_axis(two_refs: pd.DataFrame, query_axis_val: float, target_col: str, axis_col: str):
+    """
+    Draws a straight mathematical line between 2 known historical points, 
+    then finds exactly where your new target sits on that line.
+    """
+    # Sort the two reference vessels from smallest to largest
+    refs_sorted = two_refs.sort_values(axis_col).reset_index(drop=True)
+    
+    # Grab the X values (e.g., Area) and Y values (e.g., Cost) for both historical vessels
+    a_val, b_val = refs_sorted[axis_col].iloc[0], refs_sorted[axis_col].iloc[1]
+    t_a, t_b = refs_sorted[target_col].iloc[0], refs_sorted[target_col].iloc[1]
+    
+    # Safety check: if both historical vessels are the exact same size, just average their costs
+    if b_val == a_val:
+        return (t_a + t_b) / 2.0, 0.5
+        
+    # Calculate the exact percentage distance the new vessel is between the two historical ones
+    frac = (query_axis_val - a_val) / (b_val - a_val)
+    
+    # Apply that percentage to the Cost or Weight to get the final prediction
     value = t_a + frac * (t_b - t_a)
     return value, frac
 
-
 # =====================================================================
-# PAGE
+# 6. PAGE BUILDER: MECHANICAL
+# This creates the UI and logic for the Custom Vessel Predictor page.
 # =====================================================================
-st.title("⚙️ Vessel Weight Predictor")
-st.caption(
-    "Computes Volume & Area from your entered Length and Internal Diameter, finds the "
-    "2 closest historical vessels by combined Volume + Area similarity, and linearly "
-    "interpolates weight between them. Cost prediction is temporarily disabled — a "
-    "validation check showed it was unreliable (median error ~70%); it will return once "
-    "a better approach is worked out."
-)
+def mechanical_page():
+    st.title("⚙️ Vessel Weight & Cost Predictor")
+    st.caption("Computes Volume & Area... (Cost is interpolated by both Area AND Dry Weight for comparison.)")
 
-uploaded = st.file_uploader("Upload vessel database (.xlsx)", type=["xlsx"])
+    # Creates a file upload button in the sidebar
+    uploaded = st.file_uploader("Upload vessel database (.xlsx)", type=["xlsx"], key="mech_up")
 
-if uploaded is None:
-    st.info(
-        f"Upload the vessel database Excel file to begin. Expects a sheet named "
-        f"'{SHEET_NAME}' with 3 header rows followed by data rows, matching the current template."
-    )
-    st.stop()
-
-try:
-    with st.spinner("Reading and cleaning the workbook..."):
-        df = load_and_clean(uploaded)
-except ValueError:
-    st.error(f"Couldn't find sheet '{SHEET_NAME}' in this workbook. Check the sheet name and try again.")
-    st.stop()
-
-st.success(f"Loaded {len(df)} equipment rows from '{SHEET_NAME}'.")
-
-with st.expander("Preview cleaned data (Volume & Area computed from Length/Diameter)"):
-    st.dataframe(df[DISPLAY_COLS], use_container_width=True)
-
-clean = df.dropna(subset=REQUIRED_COLS + ['volume_m3']).copy()
-n_usable = len(clean)
-st.caption(
-    f"{n_usable} of {len(df)} rows had complete data (length, diameter, and all 3 weight "
-    f"figures present) and can be used as interpolation references."
-)
-
-if n_usable < 2:
-    st.warning(
-        "Need at least 2 complete historical rows to interpolate between. "
-        "Check that length, diameter, and weight are filled in for more rows."
-    )
-    st.stop()
-
-st.divider()
-
-# =====================================================================
-# PREDICTION FORM
-# =====================================================================
-st.subheader("Predict weight for a new vessel")
-
-material_options = [AUTO_OPTION] + sorted(clean['material_category'].unique())
-orientation_options = [AUTO_OPTION] + sorted(clean['orientation_clean'].unique())
-
-with st.form("prediction_form"):
-    st.markdown("**Dimensions** (used to compute Volume & Area, and to find the closest references)")
-    g1, g2 = st.columns(2)
-    with g1:
-        user_length = st.number_input("Length T/T (mm)", min_value=1.0, value=6000.0, step=100.0)
-    with g2:
-        user_diameter = st.number_input("Internal diameter (mm)", min_value=1.0, value=2000.0, step=50.0)
-
-    st.markdown("**Design conditions** (recorded for reference)")
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        user_press = st.number_input("Design pressure (barg)", value=20.0, step=1.0)
-    with d2:
-        user_temp_max = st.number_input("Design temperature — Max (°C)", value=100.0, step=5.0)
-    with d3:
-        user_temp_min = st.number_input("Design temperature — Min (°C)", value=0.0, step=5.0)
-
-    st.markdown("**Construction (optional — leave on Auto to get a recommendation)**")
-    c1, c2 = st.columns(2)
-    with c1:
-        user_material = st.selectbox("Material category", material_options)
-    with c2:
-        user_orientation = st.selectbox("Orientation", orientation_options)
-
-    submitted = st.form_submit_button("Predict", use_container_width=True, type="primary")
-
-if submitted:
-    query_volume, query_area = compute_geometry(user_length, user_diameter)
-    st.session_state['prediction_ctx'] = dict(
-        query_volume=query_volume, query_area=query_area,
-        user_material=user_material, user_orientation=user_orientation,
-    )
-
-if 'prediction_ctx' in st.session_state:
-    ctx = st.session_state['prediction_ctx']
-    query_volume, query_area = ctx['query_volume'], ctx['query_area']
-    user_material, user_orientation = ctx['user_material'], ctx['user_orientation']
-
-    st.markdown("**Computed geometry**")
-    gc1, gc2 = st.columns(2)
-    gc1.metric("Volume", f"{query_volume:.2f} m³")
-    gc2.metric("Area", f"{query_area:.2f} m²")
-
-    # --- Rank ALL usable historical vessels by combined Volume + Area distance ---
-    vol_std = clean['volume_m3'].std() or 1.0
-    area_std = clean['area_m2'].std() or 1.0
-    ranked = clean.copy()
-    ranked['distance'] = np.sqrt(
-        ((ranked['volume_m3'] - query_volume) / vol_std) ** 2
-        + ((ranked['area_m2'] - query_area) / area_std) ** 2
-    )
-    ranked = ranked.sort_values('distance').reset_index(drop=True)
-
-    # --- Let the user override which 2 vessels to interpolate between ---
-    # Defaults to the closest match by shape, but geometry alone can't know
-    # that two vessels belong to the same design family/service — so the
-    # engineer gets the final say on which pair is actually appropriate.
-    def _label(i):
-        r = ranked.iloc[i]
-        return (f"{r['equip_no']} — Vol {r['volume_m3']:.2f} m³, "
-                f"Area {r['area_m2']:.2f} m² (shape distance {r['distance']:.3f})")
-
-    st.markdown("**Reference vessels for interpolation**")
-    selected_idx = st.multiselect(
-        "Choose exactly 2 (defaults to the closest match by Volume + Area — override if a "
-        "different pair from the same design family is more appropriate)",
-        options=list(range(len(ranked))),
-        default=[0, 1],
-        format_func=_label,
-        max_selections=2,
-        key='ref_override',
-    )
-
-    if len(selected_idx) != 2:
-        st.info("Select exactly 2 reference vessels above to see the interpolated prediction.")
+    # Stop the app until a file is uploaded
+    if uploaded is None:
+        st.info(f"Upload the vessel database Excel file to begin. Expects sheet '{SHEET_NAME}'.")
         st.stop()
 
-    two_refs = ranked.iloc[selected_idx].sort_values('volume_m3').reset_index(drop=True)
-    v_min, v_max = two_refs['volume_m3'].min(), two_refs['volume_m3'].max()
-    is_true_interpolation = v_min <= query_volume <= v_max
+    # Load data
+    try:
+        with st.spinner("Reading and cleaning the workbook..."):
+            df = load_and_clean(uploaded)
+    except ValueError:
+        st.error(f"Couldn't find sheet '{SHEET_NAME}'. Check sheet name and try again.")
+        st.stop()
 
-    if is_true_interpolation:
-        st.success(
-            f"Query volume falls between the 2 chosen reference vessels — "
-            f"interpolating between **{two_refs.iloc[0]['equip_no']}** and "
-            f"**{two_refs.iloc[1]['equip_no']}**."
+    st.success(f"Loaded {len(df)} equipment rows from '{SHEET_NAME}'.")
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(df[DISPLAY_COLS], use_container_width=True)
+
+    # Filter out rows that don't have enough data to be useful
+    clean = df.dropna(subset=REQUIRED_COLS + ['volume_m3', 'area_m2']).copy()
+    if len(clean) < 2:
+        st.warning("Need at least 2 complete historical rows to interpolate between.")
+        st.stop()
+
+    st.divider()
+    st.subheader("Predict specs & cost for a new vessel")
+
+    # 6A. THE INPUT FORM
+    material_options = [AUTO_OPTION] + sorted(clean['material_category'].unique())
+    orientation_options = [AUTO_OPTION] + sorted(clean['orientation_clean'].unique())
+
+    with st.form("prediction_form"):
+        st.markdown("**Dimensions** (drives shape matching and geometry calculation)")
+        g1, g2 = st.columns(2)
+        with g1: user_length = st.number_input("Length T/T (mm)", min_value=1.0, value=6000.0, step=100.0)
+        with g2: user_diameter = st.number_input("Internal diameter (mm)", min_value=1.0, value=2000.0, step=50.0)
+
+        st.markdown("**Costing Material Selection**")
+        cost_mat = st.radio("Select Vessel Metallurgy for Costing", options=["Carbon Steel (CS)", "Stainless Steel (SS)"], horizontal=True)
+
+        st.markdown("**Design conditions** (informational / design checks)")
+        d1, d2, d3 = st.columns(3)
+        with d1: user_press = st.number_input("Design pressure (barg)", value=20.0, step=1.0)
+        with d2: user_temp_max = st.number_input("Design temperature — Max (°C)", value=100.0, step=5.0)
+        with d3: user_temp_min = st.number_input("Design temperature — Min (°C)", value=0.0, step=5.0)
+
+        st.markdown("**Construction (optional)**")
+        c1, c2 = st.columns(2)
+        with c1: user_material = st.selectbox("Historical Material Category", material_options)
+        with c2: user_orientation = st.selectbox("Orientation", orientation_options)
+
+        submitted = st.form_submit_button("Predict Weight & Cost", use_container_width=True, type="primary")
+
+    # 6B. THE MATCHING LOGIC (KNN / Shape Distance)
+    if submitted:
+        # Step 1: Calculate the Volume and Area of the new tank
+        query_volume, query_area = compute_geometry(user_length, user_diameter)
+        
+        # Save these into memory so they don't disappear if the user clicks something else
+        st.session_state['mech_ctx'] = dict(query_volume=query_volume, query_area=query_area, cost_mat=cost_mat)
+
+    if 'mech_ctx' in st.session_state:
+        ctx = st.session_state['mech_ctx']
+        query_volume, query_area = ctx['query_volume'], ctx['query_area']
+        cost_mat = ctx['cost_mat']
+
+        st.markdown("**Computed Geometry**")
+        gc1, gc2 = st.columns(2)
+        gc1.metric("Volume", f"{query_volume:.2f} m³")
+        gc2.metric("Surface Area", f"{query_area:.2f} m²")
+
+        # Step 2: Calculate Standard Deviation to put Volume and Area on an equal playing field
+        vol_std = clean['volume_m3'].std() or 1.0
+        area_std = clean['area_m2'].std() or 1.0
+        
+        # Step 3: Calculate the "Shape Distance" using the Euclidean distance formula (a^2 + b^2 = c^2)
+        ranked = clean.copy()
+        ranked['distance'] = np.sqrt(
+            ((ranked['volume_m3'] - query_volume) / vol_std) ** 2
+            + ((ranked['area_m2'] - query_area) / area_std) ** 2
         )
-    else:
-        st.warning(
-            f"Query volume falls outside the range of **{two_refs.iloc[0]['equip_no']}** "
-            f"and **{two_refs.iloc[1]['equip_no']}** — the calculation below is an "
-            f"extrapolation beyond these 2 references, not a true interpolation."
-        )
+        
+        # Sort from most similar (smallest distance) to least similar
+        ranked = ranked.sort_values('distance').reset_index(drop=True)
 
-    # --- Resolve optional material/orientation from the 2 references (for display only) ---
-    material_is_auto = user_material == AUTO_OPTION
-    orientation_is_auto = user_orientation == AUTO_OPTION
-    recommended_material = two_refs['material_category'].mode().iloc[0]
-    recommended_orientation = two_refs['orientation_clean'].mode().iloc[0]
-    resolved_material = recommended_material if material_is_auto else user_material
-    resolved_orientation = recommended_orientation if orientation_is_auto else user_orientation
+        def _label(i):
+            r = ranked.iloc[i]
+            return (f"{r['equip_no']} — Vol {r['volume_m3']:.2f} m³, Area {r['area_m2']:.2f} m², Cost {r['unit_cost_num']:,.0f} MYR (Dist {r['distance']:.3f})")
 
-    if material_is_auto or orientation_is_auto:
-        st.markdown("**Recommended construction**")
-        rc1, rc2 = st.columns(2)
-        if material_is_auto:
-            rc1.metric("Recommended Material", resolved_material)
-        if orientation_is_auto:
-            rc2.metric("Recommended Orientation", resolved_orientation)
-        st.caption("Based on the 2 chosen reference vessels.")
+        st.markdown("**Reference vessels for interpolation**")
+        # Let the user choose which of the top matches to use (defaults to the best 2)
+        selected_idx = st.multiselect("Choose exactly 2 reference vessels:", options=list(range(len(ranked))), default=[0, 1], format_func=_label, max_selections=2)
 
-    # --- Interpolate each weight output along the Volume axis ---
-    final_values, fracs = {}, {}
-    for target in TARGET_COLS:
-        value, frac = interpolate(two_refs, query_volume, target)
-        final_values[target] = value
-        fracs[target] = frac
+        if len(selected_idx) != 2:
+            st.info("Select exactly 2 reference vessels above to view predictions.")
+            st.stop()
 
-    st.markdown("**Predicted weight breakdown**")
-    w1, w2, w3 = st.columns(3)
-    for col, target in zip([w1, w2, w3], WEIGHT_TARGETS):
-        col.metric(WEIGHT_LABELS[target], f"{final_values[target]:.2f} MT")
+        two_refs = ranked.iloc[selected_idx].copy()
+        
+        # Check if the new vessel is smaller or larger than BOTH historical vessels. If so, it warns about "extrapolation"
+        v_min, v_max = two_refs['volume_m3'].min(), two_refs['volume_m3'].max()
+        a_min, a_max = two_refs['area_m2'].min(), two_refs['area_m2'].max()
+        is_extrapolating_area = not (a_min <= query_area <= a_max)
 
-    with st.expander("See the 2 reference vessels and interpolation detail"):
-        detail = pd.DataFrame({
-            "Output": [WEIGHT_LABELS[t] for t in WEIGHT_TARGETS],
-            f"{two_refs.iloc[0]['equip_no']} (Vol {v_min:.1f} m³)":
-                [f"{two_refs.iloc[0][t]:.2f}" for t in WEIGHT_TARGETS],
-            f"{two_refs.iloc[1]['equip_no']} (Vol {v_max:.1f} m³)":
-                [f"{two_refs.iloc[1][t]:.2f}" for t in WEIGHT_TARGETS],
-            "Interpolated (Your vessel)":
-                [f"{final_values[t]:.2f}" for t in WEIGHT_TARGETS],
-        })
-        st.table(detail)
-        st.caption(
-            f"Interpolation fraction along the Volume axis: {fracs['wt_unit_dry_num']:.2f} "
-            f"(0.0 = matches the smaller vessel exactly, 1.0 = matches the larger vessel exactly; "
-            f"outside [0, 1] means extrapolation)."
-        )
+        if (v_min <= query_volume <= v_max) and not is_extrapolating_area:
+            st.success("Query falls inside the reference bounds for both Volume and Area.")
+        else:
+            st.warning("Query falls outside reference ranges for Volume or Area; output may reflect linear extrapolation.")
 
-    st.markdown("**The 2 reference vessels used** (historical cost shown for context only — not used in the calculation)")
-    st.dataframe(
-        two_refs[['equip_no', 'description', 'length_num', 'diameter_num', 'volume_m3', 'area_m2',
-                   'material_category', 'orientation_clean']
-                 + WEIGHT_TARGETS + ['unit_cost_num'] + REFERENCE_COLS + ['distance']],
-        use_container_width=True
-    )
+        # 6C. CALCULATING THE PREDICTIONS
+        # Predict Weights by interpolating the Volume
+        final_weights = {}
+        for target in WEIGHT_TARGETS:
+            val, _ = interpolate_by_axis(two_refs, query_volume, target, 'volume_m3')
+            final_weights[target] = val
+            
+        query_weight = final_weights['wt_unit_dry_num']
+
+        # Predict Cost by interpolating both Area and Weight (to compare them)
+        base_cost_area, _ = interpolate_by_axis(two_refs, query_area, 'unit_cost_num', 'area_m2')
+        base_cost_weight, _ = interpolate_by_axis(two_refs, query_weight, 'unit_cost_num', 'wt_unit_dry_num')
+        
+        # Apply the material pricing multiplier
+        cost_multiplier = 4.0 if "Stainless Steel" in cost_mat else 1.0
+        final_unit_cost_area = max(0.0, base_cost_area * cost_multiplier) # max(0.0) ensures prices never drop below zero
+        final_unit_cost_weight = max(0.0, base_cost_weight * cost_multiplier)
+
+        # 6D. DISPLAYING THE RESULTS
+        st.markdown("**Predicted Weight Breakdown (Interpolated by Volume)**")
+        w1, w2, w3 = st.columns(3)
+        for col, target in zip([w1, w2, w3], WEIGHT_TARGETS):
+            col.metric(WEIGHT_LABELS[target], f"{final_weights[target]:.2f} MT")
+
+        st.markdown("**Predicted Equipment Cost Comparison**")
+        c_col1, c_col2, c_col3 = st.columns(3)
+        c_col1.metric("Final Cost (Based on Area)", f"MYR {final_unit_cost_area:,.2f}")
+        c_col2.metric("Final Cost (Based on Weight)", f"MYR {final_unit_cost_weight:,.2f}")
+        c_col3.metric("Material Factor Applied", f"{cost_multiplier:.1f}x ({cost_mat})")
+
+        # 6E. DRAWING THE GRAPHS
+        st.markdown("---")
+        st.markdown("**Interpolation Visualizations: Area vs. Dry Weight**")
+        
+        # Creates a side-by-side graph layout (1 row, 2 columns)
+        y_refs = two_refs['unit_cost_num'].values
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # --- Draw Area Graph (Left side) ---
+        x_refs_area = two_refs['area_m2'].values
+        x_min_area = min(x_refs_area[0], x_refs_area[1], query_area) * 0.98
+        x_max_area = max(x_refs_area[0], x_refs_area[1], query_area) * 1.02
+        if x_refs_area[1] != x_refs_area[0]:
+            # Calculate the slope of the line (Rise over Run)
+            slope_area = (y_refs[1] - y_refs[0]) / (x_refs_area[1] - x_refs_area[0])
+            # Draw the dotted trendline
+            ax1.plot(np.linspace(x_min_area, x_max_area, 10), slope_area * np.linspace(x_min_area, x_max_area, 10) + (y_refs[0] - slope_area * x_refs_area[0]), color='gray', linestyle='--', alpha=0.7)
+            
+        ax1.scatter(x_refs_area, y_refs, color='blue', s=100, zorder=5, label='References') # Plot historical points
+        ax1.scatter([query_area], [base_cost_area], color='red', s=250, marker='*', zorder=6, label='New Vessel') # Plot predicted point
+        ax1.set_xlabel("Surface Area (m²)", fontweight='bold')
+        ax1.set_ylabel("Base Cost (MYR)", fontweight='bold')
+        ax1.set_title("Cost Interpolation by Area")
+        ax1.grid(True, linestyle=':', alpha=0.6)
+        ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+        ax1.legend()
+
+        # --- Draw Weight Graph (Right side) ---
+        x_refs_wt = two_refs['wt_unit_dry_num'].values
+        x_min_wt = min(x_refs_wt[0], x_refs_wt[1], query_weight) * 0.98
+        x_max_wt = max(x_refs_wt[0], x_refs_wt[1], query_weight) * 1.02
+        if x_refs_wt[1] != x_refs_wt[0]:
+            slope_wt = (y_refs[1] - y_refs[0]) / (x_refs_wt[1] - x_refs_wt[0])
+            ax2.plot(np.linspace(x_min_wt, x_max_wt, 10), slope_wt * np.linspace(x_min_wt, x_max_wt, 10) + (y_refs[0] - slope_wt * x_refs_wt[0]), color='gray', linestyle='--', alpha=0.7)
+            
+        ax2.scatter(x_refs_wt, y_refs, color='blue', s=100, zorder=5, label='References')
+        ax2.scatter([query_weight], [base_cost_weight], color='red', s=250, marker='*', zorder=6, label='New Vessel')
+        ax2.set_xlabel("Dry Weight (MT)", fontweight='bold')
+        ax2.set_ylabel("Base Cost (MYR)", fontweight='bold')
+        ax2.set_title("Cost Interpolation by Dry Weight")
+        ax2.grid(True, linestyle=':', alpha=0.6)
+        ax2.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+        ax2.legend()
+        
+        plt.tight_layout() # Makes sure graphs don't overlap
+        st.pyplot(fig) # Tells Streamlit to display the graph
+
+        # Show raw data at the bottom in a drop-down expander
+        with st.expander("See calculation details and reference comparisons"):
+            st.dataframe(two_refs)
+
+
+# =====================================================================
+# 7. PAGE BUILDER: PIPING
+# This creates the UI and logic for the Standard Valve Predictor page.
+# =====================================================================
+def piping_page():
+    st.title("🔧 Valve Weight & Cost Predictor")
+    st.caption("Predicts valve weight and cost by filtering historical data for exact matches...")
+
+    uploaded = st.file_uploader("Upload valve database (.xlsx)", type=["xlsx"], key="valve_up")
+
+    if uploaded is None:
+        st.info(f"Upload the valve database Excel file to begin. Expects sheet '{VALVE_SHEET_NAME}'.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the piping workbook..."):
+            df = load_and_clean_valves(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    with st.expander("Preview cleaned data"):
+        display_cols = ['item_no', 'type_clean', 'rating_clean', 'material_clean', 'size_num', 'weight_num', 'cost_num']
+        st.dataframe(df[display_cols].head(100), use_container_width=True)
+
+    st.divider()
+    st.subheader("Predict specs & cost for a new valve")
+
+    # Grab all unique options for the dropdown menus
+    valve_types = sorted(df['type_clean'].unique())
+    valve_materials = sorted(df['material_clean'].unique())
+    valve_ratings = sorted(df['rating_clean'].unique())
+
+    # 7A. THE INPUT FORM
+    with st.form("valve_prediction_form"):
+        st.markdown("**Valve Specifications** (used for exact matching)")
+        c1, c2, c3 = st.columns(3)
+        with c1: user_type = st.selectbox("Valve Type", valve_types)
+        with c2: user_rating = st.selectbox("Pressure Rating", valve_ratings)
+        with c3: user_material = st.selectbox("Material Specification", valve_materials)
+        
+        st.markdown("**Target Dimension**")
+        user_size = st.number_input("Nominal Size (mm)", min_value=15.0, value=100.0, step=25.0)
+            
+        submitted = st.form_submit_button("Predict Weight & Cost", use_container_width=True, type="primary")
+
+    # 7B. MATCHING LOGIC (Exact Filtering)
+    if submitted:
+        # Instead of shape distance, we filter the database to find ONLY identical types/ratings/materials
+        filtered = df[
+            (df['type_clean'] == user_type) & 
+            (df['rating_clean'] == user_rating) & 
+            (df['material_clean'] == user_material)
+        ].copy()
+
+        if len(filtered) == 0:
+            st.error(f"No historical data found for {user_type} valves in {user_material} at Rating {user_rating}.")
+            st.stop()
+
+        # Calculate how close the historical sizes are to the user's requested size
+        filtered['size_diff'] = abs(filtered['size_num'] - user_size)
+        
+        # Sort so the closest sizes are at the top. If there's a tie, put the newest 'year' at the top
+        filtered = filtered.sort_values(['size_diff', 'year'], ascending=[True, False])
+        
+        # Grab exactly two distinct sizes (drop duplicates) to draw our interpolation line
+        closest_sizes = filtered.drop_duplicates(subset=['size_num']).head(2)
+
+        # 7C. CALCULATING PREDICTIONS
+        if len(closest_sizes) < 2:
+            st.warning("Only found 1 distinct size for these specs. Extrapolation is impossible; displaying exact historical match instead.")
+            final_cost = closest_sizes.iloc[0]['cost_num']
+            final_weight = closest_sizes.iloc[0]['weight_num']
+            is_interpolated = False
+        else:
+            final_cost, _ = interpolate_by_axis(closest_sizes, user_size, 'cost_num', 'size_num')
+            # Handle missing weight data gracefully
+            if closest_sizes['weight_num'].isna().any():
+                final_weight = None
+            else:
+                final_weight, _ = interpolate_by_axis(closest_sizes, user_size, 'weight_num', 'size_num')
+            is_interpolated = True
+
+        final_cost = max(0.0, final_cost)
+
+        # 7D. DISPLAYING RESULTS
+        st.markdown("**Predicted Output**")
+        out1, out2, out3 = st.columns(3)
+        out1.metric("Predicted Cost", f"RM {final_cost:,.2f}")
+        if final_weight is not None and not pd.isna(final_weight):
+            out2.metric("Predicted Weight", f"{final_weight:.1f} kg")
+        else:
+            out2.metric("Predicted Weight", "N/A")
+        out3.metric("Calculation Method", "Interpolation" if is_interpolated else "Direct Historical Match")
+
+        # 7E. DRAWING THE GRAPH
+        if is_interpolated:
+            st.markdown("---")
+            st.markdown("**Interpolation Visualization (Size vs. Cost)**")
+            
+            refs_sorted = closest_sizes.sort_values('size_num')
+            x_refs = refs_sorted['size_num'].values
+            y_refs = refs_sorted['cost_num'].values
+
+            fig, ax = plt.subplots(figsize=(10, 5))
+            
+            x_min_plot = min(x_refs[0], x_refs[1], user_size) * 0.8
+            x_max_plot = max(x_refs[0], x_refs[1], user_size) * 1.2
+            
+            # Draw the dotted trendline
+            if x_refs[1] != x_refs[0]:
+                slope = (y_refs[1] - y_refs[0]) / (x_refs[1] - x_refs[0])
+                intercept = y_refs[0] - slope * x_refs[0]
+                x_line = np.linspace(x_min_plot, x_max_plot, 100)
+                y_line = slope * x_line + intercept
+                ax.plot(x_line, y_line, color='gray', linestyle='--', alpha=0.7, label='Interpolation Trendline')
+            
+            # Plot the dots
+            ax.scatter(x_refs, y_refs, color='blue', s=100, zorder=5, label='Historical References')
+            ax.scatter([user_size], [final_cost], color='red', s=250, marker='*', zorder=6, label='Predicted Cost')
+            
+            # Formatting the graph
+            ax.set_xlabel("Nominal Size (mm)", fontweight='bold')
+            ax.set_ylabel("Unit Cost (RM)", fontweight='bold')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+            ax.legend()
+            st.pyplot(fig)
+            st.markdown("---")
+
+        with st.expander("See calculation details and filtered references"):
+            display_cols = ['item_no', 'year', 'project', 'size_num', 'rating_clean', 'weight_num', 'cost_num']
+            st.dataframe(closest_sizes[display_cols], use_container_width=True)
+
+# =====================================================================
+# 8. NAVIGATION MENU
+# This acts as a switchboard. It maps the names on the sidebar to the functions above.
+# =====================================================================
+PAGES = {
+    "Mechanical": mechanical_page, # Links to the Vessel predictor
+    "Piping": piping_page,         # Links to the Valve predictor
+}
+
+st.sidebar.title("Navigation")
+# Create radio buttons in the sidebar
+selected_page = st.sidebar.radio("Discipline", list(PAGES.keys()), key="nav_selection")
+
+# Run whichever function the user selected
+PAGES[selected_page]()
