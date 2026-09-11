@@ -186,7 +186,7 @@ def interpolate_by_axis(two_refs: pd.DataFrame, query_axis_val: float, target_co
 # =====================================================================
 def mechanical_page():
     st.title("⚙️ Vessel Weight & Cost Predictor")
-    st.caption("Computes Volume & Area... (Cost is interpolated by both Area AND Dry Weight for comparison.)")
+    st.caption("Computes Volume & Area... (Operating Weight dynamically calculated by Density. Cost interpolated by Area/Weight.)")
 
     # Creates a file upload button in the sidebar
     uploaded = st.file_uploader("Upload vessel database (.xlsx)", type=["xlsx"], key="mech_up")
@@ -231,11 +231,13 @@ def mechanical_page():
         st.markdown("**Costing Material Selection**")
         cost_mat = st.radio("Select Vessel Metallurgy for Costing", options=["Carbon Steel (CS)", "Stainless Steel (SS)"], horizontal=True)
 
-        st.markdown("**Design conditions** (informational / design checks)")
-        d1, d2, d3 = st.columns(3)
+        st.markdown("**Design conditions & Content** (informational / design checks)")
+        d1, d2, d3, d4 = st.columns(4)
         with d1: user_press = st.number_input("Design pressure (barg)", value=20.0, step=1.0)
         with d2: user_temp_max = st.number_input("Design temperature — Max (°C)", value=100.0, step=5.0)
         with d3: user_temp_min = st.number_input("Design temperature — Min (°C)", value=0.0, step=5.0)
+        # NEW INPUT: User sets the fluid/content density to calculate Operating Weight
+        with d4: content_density = st.number_input("Content Density (kg/m³)", value=1000.0, step=50.0, help="e.g. Water is ~1000 kg/m³. Used to calculate Operating Weight assuming 80% full.")
 
         st.markdown("**Construction (optional)**")
         c1, c2 = st.columns(2)
@@ -249,13 +251,19 @@ def mechanical_page():
         # Step 1: Calculate the Volume and Area of the new tank
         query_volume, query_area = compute_geometry(user_length, user_diameter)
         
-        # Save these into memory so they don't disappear if the user clicks something else
-        st.session_state['mech_ctx'] = dict(query_volume=query_volume, query_area=query_area, cost_mat=cost_mat)
+        # Save these into memory (including density) so they don't disappear if the user clicks something else
+        st.session_state['mech_ctx'] = dict(
+            query_volume=query_volume, 
+            query_area=query_area, 
+            cost_mat=cost_mat,
+            content_density=content_density
+        )
 
     if 'mech_ctx' in st.session_state:
         ctx = st.session_state['mech_ctx']
         query_volume, query_area = ctx['query_volume'], ctx['query_area']
         cost_mat = ctx['cost_mat']
+        content_density = ctx.get('content_density', 1000.0)
 
         st.markdown("**Computed Geometry**")
         gc1, gc2 = st.columns(2)
@@ -301,13 +309,22 @@ def mechanical_page():
             st.warning("Query falls outside reference ranges for Volume or Area; output may reflect linear extrapolation.")
 
         # 6C. CALCULATING THE PREDICTIONS
-        # Predict Weights by interpolating the Volume
         final_weights = {}
-        for target in WEIGHT_TARGETS:
+        
+        # Interpolate ONLY Dry Weight and Test Weight
+        for target in ['wt_unit_dry_num', 'wt_test_num']:
             val, _ = interpolate_by_axis(two_refs, query_volume, target, 'volume_m3')
             final_weights[target] = val
             
         query_weight = final_weights['wt_unit_dry_num']
+
+        # DYNAMIC CALCULATION: Operating Weight
+        # Formula: Density * (0.8 * Volume) to get kg, then divide by 1000 for Metric Tons
+        content_weight_kg = content_density * (0.8 * query_volume)
+        content_weight_mt = content_weight_kg / 1000.0
+        
+        # Sum the interpolated Dry Weight and the calculated Content Weight
+        final_weights['wt_unit_oper_num'] = query_weight + content_weight_mt
 
         # Predict Cost by interpolating both Area and Weight (to compare them)
         base_cost_area, _ = interpolate_by_axis(two_refs, query_area, 'unit_cost_num', 'area_m2')
@@ -319,10 +336,12 @@ def mechanical_page():
         final_unit_cost_weight = max(0.0, base_cost_weight * cost_multiplier)
 
         # 6D. DISPLAYING THE RESULTS
-        st.markdown("**Predicted Weight Breakdown (Interpolated by Volume)**")
+        st.markdown("**Predicted Weight Breakdown**")
         w1, w2, w3 = st.columns(3)
-        for col, target in zip([w1, w2, w3], WEIGHT_TARGETS):
-            col.metric(WEIGHT_LABELS[target], f"{final_weights[target]:.2f} MT")
+        w1.metric("Unit Dry (Interpolated)", f"{final_weights['wt_unit_dry_num']:.2f} MT")
+        w2.metric("Unit Operating (Calculated)", f"{final_weights['wt_unit_oper_num']:.2f} MT", 
+                  help=f"Dry Wt ({final_weights['wt_unit_dry_num']:.2f} MT) + Content ({content_weight_mt:.2f} MT)")
+        w3.metric("Test Weight (Interpolated)", f"{final_weights['wt_test_num']:.2f} MT")
 
         st.markdown("**Predicted Equipment Cost Comparison**")
         c_col1, c_col2, c_col3 = st.columns(3)
@@ -379,8 +398,24 @@ def mechanical_page():
 
         # Show raw data at the bottom in a drop-down expander
         with st.expander("See calculation details and reference comparisons"):
-            st.dataframe(two_refs)
-
+            v_ref_a, v_ref_b = two_refs.iloc[0], two_refs.iloc[1]
+            detail_data = {
+                "Metric": ["Area Basis", "Vol Basis", "Dry Wt (MT)", "Oper Wt (MT) - Calculated", "Test Wt (MT)", "Hist. Cost (MYR)", "Final Cost - Area (MYR)", "Final Cost - Wt (MYR)"],
+                f"Ref 1 ({v_ref_a['equip_no']})": [
+                    f"{v_ref_a['area_m2']:.1f}", f"{v_ref_a['volume_m3']:.1f}", f"{v_ref_a['wt_unit_dry_num']:.2f}",
+                    f"{v_ref_a['wt_unit_oper_num']:.2f}", f"{v_ref_a['wt_test_num']:.2f}", f"{v_ref_a['unit_cost_num']:,.0f}", "-", "-"
+                ],
+                f"Ref 2 ({v_ref_b['equip_no']})": [
+                    f"{v_ref_b['area_m2']:.1f}", f"{v_ref_b['volume_m3']:.1f}", f"{v_ref_b['wt_unit_dry_num']:.2f}",
+                    f"{v_ref_b['wt_unit_oper_num']:.2f}", f"{v_ref_b['wt_test_num']:.2f}", f"{v_ref_b['unit_cost_num']:,.0f}", "-", "-"
+                ],
+                "Interpolated Output": [
+                    f"{query_area:.1f}", f"{query_volume:.1f}", f"{final_weights['wt_unit_dry_num']:.2f}",
+                    f"{final_weights['wt_unit_oper_num']:.2f}", f"{final_weights['wt_test_num']:.2f}", "-",
+                    f"{final_unit_cost_area:,.2f}", f"{final_unit_cost_weight:,.2f}"
+                ]
+            }
+            st.table(pd.DataFrame(detail_data))
 
 # =====================================================================
 # 7. PAGE BUILDER: PIPING
