@@ -405,16 +405,21 @@ def mechanical_page():
         plt.tight_layout() # Makes sure graphs don't overlap
         st.pyplot(fig) # Tells Streamlit to display the graph
 
-        # Show raw data at the bottom in a drop-down expander
+        # Show calculation details expander
         with st.expander("See calculation details and reference comparisons"):
             v_ref_a, v_ref_b = two_refs.iloc[0], two_refs.iloc[1]
+            
+            # Safely grab the project name, defaulting to "Unknown Project" if the cell is blank in Excel
+            proj_a = v_ref_a['project'] if pd.notna(v_ref_a['project']) else "Unknown Project"
+            proj_b = v_ref_b['project'] if pd.notna(v_ref_b['project']) else "Unknown Project"
+            
             detail_data = {
                 "Metric": ["Area Basis", "Vol Basis", "Dry Wt (MT)", "Oper Wt (MT) - Calculated", "Test Wt (MT)", "Hist. Cost (MYR)", "Final Cost - Area (MYR)", "Final Cost - Wt (MYR)"],
-                f"Ref 1 ({v_ref_a['equip_no']})": [
+                f"Ref 1 ({v_ref_a['equip_no']} - {proj_a})": [
                     f"{v_ref_a['area_m2']:.1f}", f"{v_ref_a['volume_m3']:.1f}", f"{v_ref_a['wt_unit_dry_num']:.2f}",
                     f"{v_ref_a['wt_unit_oper_num']:.2f}", f"{v_ref_a['wt_test_num']:.2f}", f"{v_ref_a['unit_cost_num']:,.0f}", "-", "-"
                 ],
-                f"Ref 2 ({v_ref_b['equip_no']})": [
+                f"Ref 2 ({v_ref_b['equip_no']} - {proj_b})": [
                     f"{v_ref_b['area_m2']:.1f}", f"{v_ref_b['volume_m3']:.1f}", f"{v_ref_b['wt_unit_dry_num']:.2f}",
                     f"{v_ref_b['wt_unit_oper_num']:.2f}", f"{v_ref_b['wt_test_num']:.2f}", f"{v_ref_b['unit_cost_num']:,.0f}", "-", "-"
                 ],
@@ -425,6 +430,17 @@ def mechanical_page():
                 ]
             }
             st.table(pd.DataFrame(detail_data))
+            
+        # =================================================================
+        # NEW SECTION: Historical Project & Reference Details
+        # =================================================================
+        st.markdown("---")
+        st.markdown("### 📋 Historical Project & Reference Details")
+        st.caption("Detailed database records for the reference vessels used in this calculation.")
+        
+        # Display the selected reference rows with the most important columns
+        final_display_cols = DISPLAY_COLS + ['distance']
+        st.dataframe(two_refs[final_display_cols], use_container_width=True)
 
 # =====================================================================
 # 7. PAGE BUILDER: PIPING
@@ -554,11 +570,17 @@ def piping_page():
             ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
             ax.legend()
             st.pyplot(fig)
-            st.markdown("---")
-
-        with st.expander("See calculation details and filtered references"):
-            display_cols = ['item_no', 'year', 'project', 'size_num', 'rating_clean', 'weight_num', 'cost_num']
-            st.dataframe(closest_sizes[display_cols], use_container_width=True)
+            
+        # =================================================================
+        # NEW SECTION: Historical Project & Reference Details (Piping)
+        # =================================================================
+        st.markdown("---")
+        st.markdown("### 📋 Historical Project & Reference Details")
+        st.caption("Detailed database records for the reference valves used in this calculation.")
+        
+        # Display the selected reference rows with the most important columns
+        display_cols_piping = ['item_no', 'project', 'year', 'valve_type', 'material_clean', 'rating_clean', 'size_num', 'weight_num', 'cost_num']
+        st.dataframe(closest_sizes[display_cols_piping], use_container_width=True)
 
 # =====================================================================
 # 8. NAVIGATION MENU
