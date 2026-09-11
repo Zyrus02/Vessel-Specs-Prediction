@@ -266,9 +266,18 @@ def mechanical_page():
         content_density = ctx.get('content_density', 1000.0)
 
         st.markdown("**Computed Geometry**")
-        gc1, gc2 = st.columns(2)
-        gc1.metric("Volume", f"{query_volume:.2f} m³")
-        gc2.metric("Surface Area", f"{query_area:.2f} m²")
+        gc1, gc2, gc3 = st.columns(3)
+        gc1.metric("Total Vessel Volume", f"{query_volume:.2f} m³")
+        
+        # Calculate 80% of the volume for the content
+        content_volume = 0.8 * query_volume
+        gc2.metric(
+            "Content Volume (80% Full)", 
+            f"{content_volume:.2f} m³", 
+            help=f"Calculation: 0.8 × {query_volume:.2f} m³ (Total Volume)"
+        )
+        
+        gc3.metric("Surface Area of Vessel", f"{query_area:.2f} m²")
 
         # Step 2: Calculate Standard Deviation to put Volume and Area on an equal playing field
         vol_std = clean['volume_m3'].std() or 1.0
