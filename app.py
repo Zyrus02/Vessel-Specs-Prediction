@@ -197,6 +197,45 @@ def load_and_clean_tanks(file):
     return df
 
 # =====================================================================
+# 4.7 MECHANICAL (FILTERS) CONFIG & HELPERS 
+# =====================================================================
+FILTER_SHEET_NAME = 'Sheet1 (2)'
+
+def clean_filter_dimensions(val):
+    """Extracts numbers from messy filter dimensions like '330 (OD)' or '2,000 S/F'."""
+    if pd.isna(val) or str(val).strip() == '-': return None
+    s = str(val).replace(',', '')
+    m = re.search(r'-?\d+\.?\d*', s)
+    return float(m.group()) if m else None
+
+@st.cache_data
+def load_and_clean_filters(file):
+    """Loads and cleans the filter columns via absolute index skipping messy headers."""
+    raw = pd.read_excel(file, sheet_name=FILTER_SHEET_NAME, header=None, skiprows=4)
+    df = raw.copy()
+    
+    df['equip_no'] = df[1]
+    df['description'] = df[3]
+    
+    df['capacity_raw'] = df[6]
+    df['capacity_num'] = pd.to_numeric(df['capacity_raw'], errors='coerce')
+    
+    df['diameter_num'] = df[16].apply(clean_filter_dimensions)
+    df['height_num'] = df[17].apply(clean_filter_dimensions)
+    
+    df['wt_unit_dry_num'] = df[18].apply(first_num)
+    df['wt_unit_oper_num'] = df[19].apply(first_num)
+    df['wt_test_num'] = df[22].apply(first_num)
+    
+    df['material_category'] = df[23].apply(categorize_material)
+    df['unit_cost_num'] = df[26].apply(first_num)
+    
+    df['project'] = df[29]
+    df['year'] = df[30]
+
+    return df.dropna(subset=['capacity_num', 'material_category', 'unit_cost_num'])
+
+# =====================================================================
 # 5. SHARED MATH: LINEAR INTERPOLATION
 # The core prediction brain used by both Mechanical and Piping.
 # =====================================================================
@@ -295,7 +334,7 @@ def mechanical_page():
             query_area=query_area, 
             cost_mat=cost_mat,
             content_density=content_density,
-            user_material=user_material # Saving the material filter preference
+            user_material=user_material 
         )
 
     if 'mech_ctx' in st.session_state:
@@ -351,6 +390,10 @@ def mechanical_page():
 
         default_selections = [best_idx_1, best_idx_2] if len(ranked) > 1 else [0]
 
+        # FIX: Force Streamlit to overwrite cached selections 
+        if submitted:
+            st.session_state["mech_refs"] = default_selections
+
         def _label(i):
             r = ranked.iloc[i]
             return (f"{r['equip_no']} — {r['material_category']} — Vol {r['volume_m3']:.2f} m³, Area {r['area_m2']:.2f} m² (Dist {r['distance']:.3f})")
@@ -361,7 +404,8 @@ def mechanical_page():
             options=list(range(len(ranked))), 
             default=default_selections, 
             format_func=_label, 
-            max_selections=2
+            max_selections=2,
+            key="mech_refs"
         )
 
         if len(selected_idx) != 2:
@@ -543,16 +587,13 @@ def piping_page():
         unique_sizes = filtered.drop_duplicates(subset=['size_num']).reset_index(drop=True)
         
         if len(unique_sizes) >= 2:
-            best_idx_1 = 0
-            best_idx_2 = 1 
+            best_idx_1, best_idx_2 = 0, 1
             size_1 = unique_sizes.iloc[best_idx_1]['size_num']
-            
             for i in range(1, len(unique_sizes)):
                 size_i = unique_sizes.iloc[i]['size_num']
                 if (size_1 <= user_size <= size_i) or (size_i <= user_size <= size_1):
                     best_idx_2 = i
                     break
-                    
             closest_sizes = unique_sizes.iloc[[best_idx_1, best_idx_2]]
         else:
             closest_sizes = unique_sizes.head(2)
@@ -570,15 +611,10 @@ def piping_page():
                 final_weight, _ = interpolate_by_axis(closest_sizes, user_size, 'weight_num', 'size_num')
             is_interpolated = True
 
-        final_cost = max(0.0, final_cost)
-
         st.markdown("**Predicted Output**")
         out1, out2, out3 = st.columns(3)
-        out1.metric("Predicted Cost", f"RM {final_cost:,.2f}")
-        if final_weight is not None and not pd.isna(final_weight):
-            out2.metric("Predicted Weight", f"{final_weight:.1f} kg")
-        else:
-            out2.metric("Predicted Weight", "N/A")
+        out1.metric("Predicted Cost", f"RM {max(0.0, final_cost):,.2f}")
+        out2.metric("Predicted Weight", f"{final_weight:.1f} kg" if pd.notna(final_weight) else "N/A")
         out3.metric("Calculation Method", "Interpolation" if is_interpolated else "Direct Historical Match")
 
         if is_interpolated:
@@ -676,7 +712,7 @@ def tank_page():
             query_volume=query_volume, 
             query_area=query_area, 
             content_density=content_density,
-            user_material=user_material # Saving the material filter preference
+            user_material=user_material 
         )
 
     if 'tank_ctx' in st.session_state:
@@ -691,9 +727,6 @@ def tank_page():
         gc2.metric("Content Volume (80% Full)", f"{0.8 * query_volume:.2f} m³")
         gc3.metric("Surface Area of Tank", f"{query_area:.2f} m²")
 
-        # ==========================================================
-        # LOGIC: Filter Historical Data by User Material Selection
-        # ==========================================================
         working_df = clean.copy()
         if hist_mat != AUTO_OPTION:
             working_df = working_df[working_df['material_category'] == hist_mat].copy()
@@ -717,12 +750,17 @@ def tank_page():
                     break
 
         default_selections = [best_idx_1, best_idx_2] if len(ranked) > 1 else [0]
+        
+        if submitted:
+            st.session_state["tank_refs"] = default_selections
+
         selected_idx = st.multiselect(
             f"Choose exactly 2 reference tanks (Filtered by: {hist_mat}):", 
             options=list(range(len(ranked))), 
             default=default_selections, 
             format_func=lambda i: f"{ranked.iloc[i]['equip_no']} — {ranked.iloc[i]['material_category']} — Vol {ranked.iloc[i]['volume_m3']:.2f} m³, Area {ranked.iloc[i]['area_m2']:.2f} m² (Dist {ranked.iloc[i]['distance']:.3f})", 
-            max_selections=2, key="tank_refs"
+            max_selections=2, 
+            key="tank_refs"
         )
 
         if len(selected_idx) != 2:
@@ -749,7 +787,6 @@ def tank_page():
         base_cost_area, _ = interpolate_by_axis(two_refs, query_area, 'unit_cost_num', 'area_m2')
         base_cost_weight, _ = interpolate_by_axis(two_refs, query_weight, 'unit_cost_num', 'wt_unit_dry_num')
         
-        # REMOVED THE MULTIPLIER ENTIRELY
         final_unit_cost_area = max(0.0, base_cost_area)
         final_unit_cost_weight = max(0.0, base_cost_weight)
 
@@ -805,11 +842,106 @@ def tank_page():
         st.dataframe(two_refs[tank_display_cols + ['distance']], use_container_width=True)
 
 # =====================================================================
+# 7.7 PAGE BUILDER: MECHANICAL (FILTERS)
+# =====================================================================
+def filter_page():
+    st.title("🚰 Filter Spec & Cost Lookup")
+    st.caption("Strict historical lookup. Matches based on Material and closest matching (rounded up) Capacity. No interpolation.")
+
+    uploaded = st.file_uploader("Upload filter database (.xlsx)", type=["xlsx"], key="filter_up")
+
+    if uploaded is None:
+        st.info(f"Upload the filter database Excel file to begin. Expects sheet '{FILTER_SHEET_NAME}'.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the filter workbook..."):
+            df = load_and_clean_filters(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    display_cols = ['equip_no', 'description', 'capacity_num', 'material_category', 
+                    'diameter_num', 'height_num', 'wt_unit_dry_num', 'wt_unit_oper_num', 
+                    'wt_test_num', 'unit_cost_num']
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(df[display_cols], use_container_width=True)
+
+    st.divider()
+    st.subheader("Lookup specs & cost for a new filter")
+
+    material_options = sorted(df['material_category'].astype(str).unique())
+    
+    # Inject 'SS' as a placeholder if it doesn't exist in the historical data
+    if 'SS' not in material_options:
+        material_options.append('SS')
+        material_options = sorted(material_options)
+
+    with st.form("filter_prediction_form"):
+        st.markdown("**Search Parameters**")
+        c1, c2 = st.columns(2)
+        with c1: user_capacity = st.number_input("Selection Capacity (m³)", min_value=1.0, value=10.0, step=1.0)
+        with c2: user_material = st.selectbox("Selection Material", material_options)
+
+        submitted = st.form_submit_button("Lookup Existing Data", use_container_width=True, type="primary")
+
+    if submitted:
+        # Special check for SS placeholder
+        if user_material == 'SS' and len(df[df['material_category'] == 'SS']) == 0:
+            st.warning("⚠️ Stainless Steel (SS) filters are currently unavailable in the historical database. Please select another material.")
+            st.stop()
+            
+        # Step 1: Filter by exact material
+        mat_filtered = df[df['material_category'] == user_material].copy()
+        
+        if len(mat_filtered) == 0:
+            st.error(f"No historical data found for '{user_material}' filters.")
+            st.stop()
+            
+        # Step 2: Capacity Round-up Logic
+        valid_capacities = mat_filtered[mat_filtered['capacity_num'] >= user_capacity]
+        
+        if len(valid_capacities) == 0:
+            st.warning(f"Requested capacity ({user_capacity} m³) exceeds our maximum historical data for {user_material}. Displaying the largest available matching filters.")
+            max_cap = mat_filtered['capacity_num'].max()
+            final_matches = mat_filtered[mat_filtered['capacity_num'] == max_cap]
+        else:
+            target_capacity = valid_capacities['capacity_num'].min()
+            final_matches = mat_filtered[mat_filtered['capacity_num'] == target_capacity]
+
+            if target_capacity > user_capacity:
+                st.info(f"Requested capacity: **{user_capacity} m³**. Rounded up to nearest available historical size: **{target_capacity} m³**.")
+            else:
+                st.success(f"Found exact capacity match for **{target_capacity} m³**.")
+
+        # Display the results
+        st.markdown("### 📊 Existing Historical Matches")
+        
+        res_df = final_matches[display_cols].copy()
+        res_df.columns = ['Equip No.', 'Description', 'Capacity (m³)', 'Material', 'Diameter (mm)', 'Height (mm)', 'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)', 'Unit Cost (MYR)']
+        
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+        
+        if len(final_matches) > 1:
+            st.markdown(f"*Note: Found {len(final_matches)} historical filters with identical capacity and material. Averages shown below.*")
+            
+        avg_cost = final_matches['unit_cost_num'].mean()
+        avg_dry = final_matches['wt_unit_dry_num'].mean()
+        avg_oper = final_matches['wt_unit_oper_num'].mean()
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Average Historical Cost", f"MYR {avg_cost:,.2f}")
+        c2.metric("Average Dry Weight", f"{avg_dry:,.2f} MT")
+        c3.metric("Average Operating Weight", f"{avg_oper:,.2f} MT")
+
+# =====================================================================
 # 8. NAVIGATION MENU
 # =====================================================================
 PAGES = {
     "Mechanical (Vessel)": mechanical_page, 
     "Mechanical (Tank)": tank_page,
+    "Mechanical (Filter)": filter_page,
     "Piping (Valve)": piping_page,         
 }
 
