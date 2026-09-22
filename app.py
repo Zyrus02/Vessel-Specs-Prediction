@@ -236,6 +236,88 @@ def load_and_clean_filters(file):
     return df.dropna(subset=['capacity_num', 'material_category', 'unit_cost_num'])
 
 # =====================================================================
+# 4.9 MECHANICAL (LAUNCHER) CONFIG & HELPERS
+# A Launcher/Receiver is modeled as two stacked cylindrical sections:
+# a "Major" barrel and a "Minor" barrel (e.g. reducer/minor bore section).
+# Volume & Area are simply the sum of both cylindrical sections.
+# =====================================================================
+LAUNCHER_SHEET_NAME = 'Sheet1 (2)'
+
+# Column positions (0-indexed, after skiprows=4) matching
+# "Overall_Launcher_Receiver_Database_Rev1.xlsx" / sheet 'Sheet1 (2)'.
+LAUNCHER_COL_MAP = {
+    'equip_no':          1,    # EQUIPMENT NO. (BED)
+    'description':       3,    # DESCRIPTION
+    'design_press':      9,    # DESIGN CONDITIONS — PRESS. (barg)
+    'design_temp_max':   10,   # DESIGN CONDITIONS — TEMP. Max (oC)
+    'design_temp_min':   11,   # DESIGN CONDITIONS — TEMP. Min (oC)
+    'major_length':      14,   # DIMENSIONS/UNIT — MAJOR LENGTH (mm)
+    'minor_length':      15,   # DIMENSIONS/UNIT — MINOR LENGTH (mm)
+    'major_id':          16,   # DIMENSIONS/UNIT — MAJOR ID (mm)
+    'minor_id':          17,   # DIMENSIONS/UNIT — MINOR ID (mm)
+    'wt_unit_dry':       19,   # WEIGHT — UNIT DRY (MT)
+    'wt_unit_oper':      20,   # WEIGHT — UNIT OPER. (MT)
+    'wt_test':           23,   # WEIGHT — TEST (MT)
+    'material':          24,   # MATERIAL
+    'unit_cost':         26,   # UNIT COST (MYR)
+    'project':           29,   # NAME OF PROJECT
+    'year':              30,   # YEAR
+}
+
+def compute_geometry_launcher(major_length_mm, major_id_mm, minor_length_mm, minor_id_mm):
+    """Adds up the Major and Minor cylindrical sections into one total Volume (m3) and Area (m2)."""
+    major_volume, major_area = compute_geometry(major_length_mm, major_id_mm)
+    minor_volume, minor_area = compute_geometry(minor_length_mm, minor_id_mm)
+    total_volume = major_volume + minor_volume
+    total_area = major_area + minor_area
+    return total_volume, total_area, major_volume, major_area, minor_volume, minor_area
+
+@st.cache_data
+def load_and_clean_launchers(file):
+    """Loads and cleans the Launcher workbook using the column index map above."""
+    raw = pd.read_excel(file, sheet_name=LAUNCHER_SHEET_NAME, header=None, skiprows=4)
+    df = raw.copy()
+
+    df['equip_no'] = df[LAUNCHER_COL_MAP['equip_no']]
+    df['description'] = df[LAUNCHER_COL_MAP['description']]
+
+    df['design_press_num'] = df[LAUNCHER_COL_MAP['design_press']].apply(first_num)
+    df['design_temp_max_num'] = df[LAUNCHER_COL_MAP['design_temp_max']].apply(first_num)
+    df['design_temp_min_num'] = df[LAUNCHER_COL_MAP['design_temp_min']].apply(first_num)
+
+    df['major_length_num'] = df[LAUNCHER_COL_MAP['major_length']].apply(first_num)
+    df['major_id_num'] = df[LAUNCHER_COL_MAP['major_id']].apply(first_num)
+    df['minor_length_num'] = df[LAUNCHER_COL_MAP['minor_length']].apply(first_num)
+    df['minor_id_num'] = df[LAUNCHER_COL_MAP['minor_id']].apply(first_num)
+
+    df['wt_unit_dry_num'] = df[LAUNCHER_COL_MAP['wt_unit_dry']].apply(first_num)
+    df['wt_unit_oper_num'] = df[LAUNCHER_COL_MAP['wt_unit_oper']].apply(first_num)
+    df['wt_test_num'] = df[LAUNCHER_COL_MAP['wt_test']].apply(first_num)
+
+    df['material_category'] = df[LAUNCHER_COL_MAP['material']].apply(categorize_material)
+    df['unit_cost_num'] = df[LAUNCHER_COL_MAP['unit_cost']].apply(first_num)
+
+    df['project'] = df[LAUNCHER_COL_MAP['project']]
+    df['year'] = df[LAUNCHER_COL_MAP['year']]
+
+    # Calculate combined Major + Minor volume/area for every historical row
+    geo = df.apply(
+        lambda r: compute_geometry_launcher(
+            r['major_length_num'], r['major_id_num'], r['minor_length_num'], r['minor_id_num']
+        ) if pd.notna(r['major_length_num']) and pd.notna(r['major_id_num'])
+           and pd.notna(r['minor_length_num']) and pd.notna(r['minor_id_num']) else (None, None, None, None, None, None),
+        axis=1, result_type='expand'
+    )
+    df['volume_m3'] = geo[0]
+    df['area_m2'] = geo[1]
+    df['major_volume_m3'] = geo[2]
+    df['major_area_m2'] = geo[3]
+    df['minor_volume_m3'] = geo[4]
+    df['minor_area_m2'] = geo[5]
+
+    return df
+
+# =====================================================================
 # 5. SHARED MATH: LINEAR INTERPOLATION
 # The core prediction brain used by both Mechanical and Piping.
 # =====================================================================
@@ -845,7 +927,7 @@ def tank_page():
 # 7.7 PAGE BUILDER: MECHANICAL (FILTERS)
 # =====================================================================
 def filter_page():
-    st.title("🚰 Filter Spec & Cost Lookup")
+    st.title("Filter Spec & Cost Lookup")
     st.caption("Strict historical lookup. Matches based on Material and closest matching (rounded up) Capacity. No interpolation.")
 
     uploaded = st.file_uploader("Upload filter database (.xlsx)", type=["xlsx"], key="filter_up")
@@ -863,7 +945,7 @@ def filter_page():
 
     display_cols = ['equip_no', 'description', 'capacity_num', 'material_category', 
                     'diameter_num', 'height_num', 'wt_unit_dry_num', 'wt_unit_oper_num', 
-                    'wt_test_num', 'unit_cost_num']
+                    'wt_test_num', 'unit_cost_num', 'project', 'year']
 
     with st.expander("Preview cleaned data"):
         st.dataframe(df[display_cols], use_container_width=True)
@@ -919,7 +1001,7 @@ def filter_page():
         st.markdown("### 📊 Existing Historical Matches")
         
         res_df = final_matches[display_cols].copy()
-        res_df.columns = ['Equip No.', 'Description', 'Capacity (m³)', 'Material', 'Diameter (mm)', 'Height (mm)', 'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)', 'Unit Cost (MYR)']
+        res_df.columns = ['Equip No.', 'Description', 'Capacity (m³)', 'Material', 'Diameter (mm)', 'Height (mm)', 'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)', 'Unit Cost (MYR)', 'Project', 'Year']
         
         st.dataframe(res_df, use_container_width=True, hide_index=True)
         
@@ -936,12 +1018,226 @@ def filter_page():
         c3.metric("Average Operating Weight", f"{avg_oper:,.2f} MT")
 
 # =====================================================================
+# 7.9 PAGE BUILDER: MECHANICAL (LAUNCHER)
+# =====================================================================
+def launcher_page():
+    st.title("Launcher/Receiver Weight & Cost Predictor")
+    st.caption("Computes total Volume & Area from Major + Minor cylindrical sections. "
+               "Design conditions are informational. Weights & Cost interpolated from 2 chosen historical references.")
+
+    uploaded = st.file_uploader("Upload launcher database (.xlsx)", type=["xlsx"], key="launcher_up")
+
+    if uploaded is None:
+        st.info(f"Upload the launcher database Excel file to begin. Expects sheet '{LAUNCHER_SHEET_NAME}'.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the workbook..."):
+            df = load_and_clean_launchers(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    launcher_required_cols = ['major_length_num', 'major_id_num', 'minor_length_num', 'minor_id_num',
+                               'wt_unit_dry_num', 'wt_test_num', 'unit_cost_num']
+    launcher_display_cols = ['equip_no', 'description', 'design_press_num', 'design_temp_max_num', 'design_temp_min_num',
+                              'major_length_num', 'major_id_num', 'minor_length_num', 'minor_id_num',
+                              'volume_m3', 'area_m2', 'material_category',
+                              'wt_unit_dry_num', 'wt_unit_oper_num', 'wt_test_num', 'unit_cost_num',
+                              'project', 'year']
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(df[launcher_display_cols], use_container_width=True)
+
+    clean = df.dropna(subset=launcher_required_cols + ['volume_m3', 'area_m2']).copy()
+    if len(clean) < 2:
+        st.warning("Need at least 2 complete historical rows to interpolate between.")
+        st.stop()
+
+    st.divider()
+    st.subheader("Predict specs & cost for a new launcher")
+
+    material_options = [AUTO_OPTION] + sorted(clean['material_category'].astype(str).unique())
+
+    with st.form("launcher_prediction_form"):
+        st.markdown("**Design Conditions**")
+        d1, d2, d3 = st.columns(3)
+        with d1: user_press = st.number_input("Design pressure (barg)", value=20.0, step=1.0)
+        with d2: user_temp_max = st.number_input("Design temperature — Max (°C)", value=100.0, step=5.0)
+        with d3: user_temp_min = st.number_input("Design temperature — Min (°C)", value=0.0, step=5.0)
+
+        st.markdown("**Dimensions — Major Section** (drives shape matching and geometry calculation)")
+        g1, g2 = st.columns(2)
+        with g1: user_major_length = st.number_input("Major length (mm)", min_value=1.0, value=6000.0, step=100.0)
+        with g2: user_major_id = st.number_input("Major internal diameter (mm)", min_value=1.0, value=900.0, step=50.0)
+
+        st.markdown("**Dimensions — Minor Section**")
+        g3, g4 = st.columns(2)
+        with g3: user_minor_length = st.number_input("Minor length (mm)", min_value=1.0, value=2000.0, step=100.0)
+        with g4: user_minor_id = st.number_input("Minor internal diameter (mm)", min_value=1.0, value=400.0, step=50.0)
+
+        st.markdown("**Construction Filter**")
+        user_material = st.selectbox("Historical Material Category (Strict Filter)", material_options, key="launcher_hist_mat")
+
+        submitted = st.form_submit_button("Predict Weight & Cost", use_container_width=True, type="primary")
+
+    if submitted:
+        total_volume, total_area, major_volume, major_area, minor_volume, minor_area = compute_geometry_launcher(
+            user_major_length, user_major_id, user_minor_length, user_minor_id
+        )
+        st.session_state['launcher_ctx'] = dict(
+            query_volume=total_volume,
+            query_area=total_area,
+            major_volume=major_volume,
+            major_area=major_area,
+            minor_volume=minor_volume,
+            minor_area=minor_area,
+            user_press=user_press,
+            user_temp_max=user_temp_max,
+            user_temp_min=user_temp_min,
+            user_material=user_material,
+        )
+
+    if 'launcher_ctx' in st.session_state:
+        ctx = st.session_state['launcher_ctx']
+        query_volume, query_area = ctx['query_volume'], ctx['query_area']
+        hist_mat = ctx.get('user_material', AUTO_OPTION)
+
+        st.markdown("**Computed Geometry (Major + Minor)**")
+        gc1, gc2, gc3 = st.columns(3)
+        gc1.metric("Major Section", f"{ctx['major_volume']:.3f} m³ / {ctx['major_area']:.3f} m²")
+        gc2.metric("Minor Section", f"{ctx['minor_volume']:.3f} m³ / {ctx['minor_area']:.3f} m²")
+        gc3.metric("Total (Major + Minor)", f"{query_volume:.3f} m³ / {query_area:.3f} m²")
+
+        working_df = clean.copy()
+        if hist_mat != AUTO_OPTION:
+            working_df = working_df[working_df['material_category'] == hist_mat].copy()
+            if len(working_df) < 2:
+                st.error(f"Not enough historical data found for material '{hist_mat}'. We need at least 2 references to interpolate. Please select '{AUTO_OPTION}' or a different material.")
+                st.stop()
+
+        vol_std = working_df['volume_m3'].std() or 1.0
+        area_std = working_df['area_m2'].std() or 1.0
+
+        ranked = working_df.copy()
+        ranked['distance'] = np.sqrt(
+            ((ranked['volume_m3'] - query_volume) / vol_std) ** 2
+            + ((ranked['area_m2'] - query_area) / area_std) ** 2
+        )
+        ranked = ranked.sort_values('distance').reset_index(drop=True)
+
+        best_idx_1, best_idx_2 = 0, 1
+        if len(ranked) > 1:
+            vol_1 = ranked.iloc[best_idx_1]['volume_m3']
+            for i in range(1, len(ranked)):
+                vol_i = ranked.iloc[i]['volume_m3']
+                if (vol_1 <= query_volume <= vol_i) or (vol_i <= query_volume <= vol_1):
+                    best_idx_2 = i
+                    break
+
+        default_selections = [best_idx_1, best_idx_2] if len(ranked) > 1 else [0]
+
+        if submitted:
+            st.session_state["launcher_refs"] = default_selections
+
+        selected_idx = st.multiselect(
+            f"Choose exactly 2 reference launchers (Filtered by: {hist_mat}):",
+            options=list(range(len(ranked))),
+            default=default_selections,
+            format_func=lambda i: (f"{ranked.iloc[i]['equip_no']} — {ranked.iloc[i]['material_category']} — "
+                                    f"Vol {ranked.iloc[i]['volume_m3']:.2f} m³, Area {ranked.iloc[i]['area_m2']:.2f} m² "
+                                    f"(Dist {ranked.iloc[i]['distance']:.3f})"),
+            max_selections=2,
+            key="launcher_refs"
+        )
+
+        if len(selected_idx) != 2:
+            st.info("Select exactly 2 reference launchers above to view predictions.")
+            st.stop()
+
+        two_refs = ranked.iloc[selected_idx].copy()
+        v_min, v_max = two_refs['volume_m3'].min(), two_refs['volume_m3'].max()
+        a_min, a_max = two_refs['area_m2'].min(), two_refs['area_m2'].max()
+
+        if (v_min <= query_volume <= v_max) and (a_min <= query_area <= a_max):
+            st.success("Query falls inside the reference bounds for both Volume and Area.")
+        else:
+            st.warning("Query falls outside reference ranges for Volume or Area; output may reflect linear extrapolation.")
+
+        # Unit Dry, Unit Operating and Test weights are all interpolated directly by Volume
+        final_weights = {}
+        for target in ['wt_unit_dry_num', 'wt_unit_oper_num', 'wt_test_num']:
+            final_weights[target], _ = interpolate_by_axis(two_refs, query_volume, target, 'volume_m3')
+
+        query_weight = final_weights['wt_unit_dry_num']
+
+        base_cost_area, _ = interpolate_by_axis(two_refs, query_area, 'unit_cost_num', 'area_m2')
+        base_cost_weight, _ = interpolate_by_axis(two_refs, query_weight, 'unit_cost_num', 'wt_unit_dry_num')
+
+        final_unit_cost_area = max(0.0, base_cost_area)
+        final_unit_cost_weight = max(0.0, base_cost_weight)
+
+        st.markdown("**Predicted Weight Breakdown**")
+        w1, w2, w3 = st.columns(3)
+        w1.metric("Unit Dry (Interpolated)", f"{final_weights['wt_unit_dry_num']:.2f} MT")
+        w2.metric("Unit Operating (Interpolated)", f"{final_weights['wt_unit_oper_num']:.2f} MT")
+        w3.metric("Test Weight (Interpolated)", f"{final_weights['wt_test_num']:.2f} MT")
+
+        st.markdown("**Predicted Equipment Cost Comparison**")
+        c_col1, c_col2 = st.columns(2)
+        c_col1.metric("Final Cost (Based on Area)", f"MYR {final_unit_cost_area:,.2f}")
+        c_col2.metric("Final Cost (Based on Weight)", f"MYR {final_unit_cost_weight:,.2f}")
+
+        st.markdown("---")
+        st.markdown("**Interpolation Visualizations: Area vs. Dry Weight**")
+        y_refs = two_refs['unit_cost_num'].values
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        x_refs_area = two_refs['area_m2'].values
+        x_min_a = min(x_refs_area[0], x_refs_area[1], query_area) * 0.98
+        x_max_a = max(x_refs_area[0], x_refs_area[1], query_area) * 1.02
+        if x_refs_area[1] != x_refs_area[0]:
+            slope_area = (y_refs[1] - y_refs[0]) / (x_refs_area[1] - x_refs_area[0])
+            ax1.plot(np.linspace(x_min_a, x_max_a, 10), slope_area * np.linspace(x_min_a, x_max_a, 10) + (y_refs[0] - slope_area * x_refs_area[0]), color='gray', linestyle='--', alpha=0.7)
+        ax1.scatter(x_refs_area, y_refs, color='blue', s=100, zorder=5, label='References')
+        ax1.scatter([query_area], [base_cost_area], color='red', s=250, marker='*', zorder=6, label='New Launcher')
+        ax1.set_xlabel("Surface Area (m²)", fontweight='bold')
+        ax1.set_ylabel("Base Cost (MYR)", fontweight='bold')
+        ax1.set_title("Cost Interpolation by Area")
+        ax1.grid(True, linestyle=':', alpha=0.6)
+        ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+        ax1.legend()
+
+        x_refs_wt = two_refs['wt_unit_dry_num'].values
+        x_min_w = min(x_refs_wt[0], x_refs_wt[1], query_weight) * 0.98
+        x_max_w = max(x_refs_wt[0], x_refs_wt[1], query_weight) * 1.02
+        if x_refs_wt[1] != x_refs_wt[0]:
+            slope_wt = (y_refs[1] - y_refs[0]) / (x_refs_wt[1] - x_refs_wt[0])
+            ax2.plot(np.linspace(x_min_w, x_max_w, 10), slope_wt * np.linspace(x_min_w, x_max_w, 10) + (y_refs[0] - slope_wt * x_refs_wt[0]), color='gray', linestyle='--', alpha=0.7)
+        ax2.scatter(x_refs_wt, y_refs, color='blue', s=100, zorder=5, label='References')
+        ax2.scatter([query_weight], [base_cost_weight], color='red', s=250, marker='*', zorder=6, label='New Launcher')
+        ax2.set_xlabel("Dry Weight (MT)", fontweight='bold')
+        ax2.set_ylabel("Base Cost (MYR)", fontweight='bold')
+        ax2.set_title("Cost Interpolation by Dry Weight")
+        ax2.grid(True, linestyle=':', alpha=0.6)
+        ax2.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+        ax2.legend()
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
+        st.markdown("---")
+        st.markdown("### 📋 Historical Project & Reference Details")
+        st.dataframe(two_refs[launcher_display_cols + ['distance']], use_container_width=True)
+
+# =====================================================================
 # 8. NAVIGATION MENU
 # =====================================================================
 PAGES = {
     "Mechanical (Vessel)": mechanical_page, 
     "Mechanical (Tank)": tank_page,
     "Mechanical (Filter)": filter_page,
+    "Mechanical (Launcher)": launcher_page,
     "Piping (Valve)": piping_page,         
 }
 
