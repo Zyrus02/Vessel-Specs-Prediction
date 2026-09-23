@@ -217,12 +217,23 @@ def load_and_clean_filters(file):
     df['equip_no'] = df[1]
     df['description'] = df[3]
     
+    # Capacity handling
     df['capacity_raw'] = df[6]
     df['capacity_num'] = pd.to_numeric(df['capacity_raw'], errors='coerce')
+    
+    # Design Conditions
+    df['design_press'] = df[10]
+    df['design_temp_max'] = df[11]
+    df['design_temp_min'] = df[12]
+    
+    # Dimensions (Col 16 is Width/ID, 17 is Height)
+    df['diameter_raw'] = df[16] # Keep raw string for UI display (e.g. '330 (OD)')
+    df['height_raw'] = df[17]   # Keep raw string for UI display (e.g. '1,260 T/T')
     
     df['diameter_num'] = df[16].apply(clean_filter_dimensions)
     df['height_num'] = df[17].apply(clean_filter_dimensions)
     
+    # Weights and Costs
     df['wt_unit_dry_num'] = df[18].apply(first_num)
     df['wt_unit_oper_num'] = df[19].apply(first_num)
     df['wt_test_num'] = df[22].apply(first_num)
@@ -237,14 +248,9 @@ def load_and_clean_filters(file):
 
 # =====================================================================
 # 4.9 MECHANICAL (LAUNCHER) CONFIG & HELPERS
-# A Launcher/Receiver is modeled as two stacked cylindrical sections:
-# a "Major" barrel and a "Minor" barrel (e.g. reducer/minor bore section).
-# Volume & Area are simply the sum of both cylindrical sections.
 # =====================================================================
 LAUNCHER_SHEET_NAME = 'Sheet1 (2)'
 
-# Column positions (0-indexed, after skiprows=4) matching
-# "Overall_Launcher_Receiver_Database_Rev1.xlsx" / sheet 'Sheet1 (2)'.
 LAUNCHER_COL_MAP = {
     'equip_no':          1,    # EQUIPMENT NO. (BED)
     'description':       3,    # DESCRIPTION
@@ -315,7 +321,9 @@ def load_and_clean_launchers(file):
     df['minor_volume_m3'] = geo[4]
     df['minor_area_m2'] = geo[5]
 
-    return df
+    # Require essential fields for interpolation
+    req_cols = ['major_length_num', 'major_id_num', 'wt_unit_dry_num', 'unit_cost_num', 'volume_m3', 'area_m2']
+    return df.dropna(subset=req_cols)
 
 # =====================================================================
 # 5. SHARED MATH: LINEAR INTERPOLATION
@@ -566,6 +574,8 @@ def mechanical_page():
         x_max_wt = max(x_refs_wt[0], x_refs_wt[1], query_weight) * 1.02
         if x_refs_wt[1] != x_refs_wt[0]:
             slope_wt = (y_refs[1] - y_refs[0]) / (x_refs_wt[1] - x_refs_wt[0])
+            
+            # ---> FIX APPLIED HERE: Changed x_min_w to x_min_wt and x_max_w to x_max_wt
             ax2.plot(np.linspace(x_min_wt, x_max_wt, 10), slope_wt * np.linspace(x_min_wt, x_max_wt, 10) + (y_refs[0] - slope_wt * x_refs_wt[0]), color='gray', linestyle='--', alpha=0.7)
             
         ax2.scatter(x_refs_wt, y_refs, color='blue', s=100, zorder=5, label='References')
@@ -944,7 +954,8 @@ def filter_page():
         st.stop()
 
     display_cols = ['equip_no', 'description', 'capacity_num', 'material_category', 
-                    'diameter_num', 'height_num', 'wt_unit_dry_num', 'wt_unit_oper_num', 
+                    'design_press', 'design_temp_max', 'design_temp_min',
+                    'diameter_raw', 'height_raw', 'wt_unit_dry_num', 'wt_unit_oper_num', 
                     'wt_test_num', 'unit_cost_num', 'project', 'year']
 
     with st.expander("Preview cleaned data"):
@@ -998,10 +1009,13 @@ def filter_page():
                 st.success(f"Found exact capacity match for **{target_capacity} m³**.")
 
         # Display the results
-        st.markdown("### 📊 Existing Historical Matches")
+        st.markdown("### 🎯 Exact Historical Matches")
         
         res_df = final_matches[display_cols].copy()
-        res_df.columns = ['Equip No.', 'Description', 'Capacity (m³)', 'Material', 'Diameter (mm)', 'Height (mm)', 'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)', 'Unit Cost (MYR)', 'Project', 'Year']
+        res_df.columns = ['Equip No.', 'Description', 'Capacity (m³)', 'Material', 
+                          'Design Press. (barg)', 'Design Temp Max (°C)', 'Design Temp Min (°C)',
+                          'Diameter/Width', 'Height', 'Dry Wt (MT)', 'Oper. Wt (MT)', 
+                          'Test Wt (MT)', 'Unit Cost (MYR)', 'Project', 'Year']
         
         st.dataframe(res_df, use_container_width=True, hide_index=True)
         
@@ -1016,6 +1030,8 @@ def filter_page():
         c1.metric("Average Historical Cost", f"MYR {avg_cost:,.2f}")
         c2.metric("Average Dry Weight", f"{avg_dry:,.2f} MT")
         c3.metric("Average Operating Weight", f"{avg_oper:,.2f} MT")
+
+
 
 # =====================================================================
 # 7.9 PAGE BUILDER: MECHANICAL (LAUNCHER)
@@ -1103,7 +1119,7 @@ def launcher_page():
         query_volume, query_area = ctx['query_volume'], ctx['query_area']
         hist_mat = ctx.get('user_material', AUTO_OPTION)
 
-        st.markdown("**Computed Geometry (Major + Minor)**")
+        st.markdown("**Computed Geometry (Volume / Area)**")
         gc1, gc2, gc3 = st.columns(3)
         gc1.metric("Major Section", f"{ctx['major_volume']:.3f} m³ / {ctx['major_area']:.3f} m²")
         gc2.metric("Minor Section", f"{ctx['minor_volume']:.3f} m³ / {ctx['minor_area']:.3f} m²")
@@ -1116,8 +1132,7 @@ def launcher_page():
                 st.error(f"Not enough historical data found for material '{hist_mat}'. We need at least 2 references to interpolate. Please select '{AUTO_OPTION}' or a different material.")
                 st.stop()
 
-        vol_std = working_df['volume_m3'].std() or 1.0
-        area_std = working_df['area_m2'].std() or 1.0
+        vol_std, area_std = working_df['volume_m3'].std() or 1.0, working_df['area_m2'].std() or 1.0
 
         ranked = working_df.copy()
         ranked['distance'] = np.sqrt(
