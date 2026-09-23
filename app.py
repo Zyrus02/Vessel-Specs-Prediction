@@ -247,6 +247,80 @@ def load_and_clean_filters(file):
     return df.dropna(subset=['capacity_num', 'material_category', 'unit_cost_num'])
 
 # =====================================================================
+# 4.8 MECHANICAL (HEAT EXCHANGER) CONFIG & HELPERS
+# Input (blue-highlighted in the source workbook): Type of Heat Exchanger + Capacity (kW)
+# Output (green-highlighted): Unit Cost, Sub Total (Total Cost), Unit Operating Weight
+# =====================================================================
+HX_SHEET_NAME = 'Sheet1 (2)'
+
+# Column positions (0-indexed, after skiprows=4) matching
+# "Overall_Heat_Exchanger_Database_Rev1.xlsx" / sheet 'Sheet1 (2)'.
+HX_COL_MAP = {
+    'equip_no':          1,    # EQUIPMENT NO. (BED)
+    'description':       3,    # DESCRIPTION
+    'hx_type':           6,    # TYPE OF HEAT EXCHANGER  (blue input)
+    'capacity':          7,    # CAPACITY (kW)           (blue input)
+    'design_press':      10,   # DESIGN CONDITIONS — PRESS. (barg)
+    'design_temp_max':   11,   # DESIGN CONDITIONS — TEMP. Max (oC)
+    'design_temp_min':   12,   # DESIGN CONDITIONS — TEMP. Min (oC)
+    'length':            15,   # DIMENSIONS/UNIT — LENGTH (mm)
+    'width_id':          16,   # DIMENSIONS/UNIT — WIDTH/ID (mm)
+    'height':            17,   # DIMENSIONS/UNIT — HEIGHT (mm)
+    'wt_unit_dry':       18,   # WEIGHT — UNIT DRY (MT)
+    'wt_unit_oper':      19,   # WEIGHT — UNIT OPER. (MT)   (green output)
+    'wt_tot_dry':        20,   # WEIGHT — TOT. DRY (MT)
+    'wt_tot_oper':       21,   # WEIGHT — TOT. OPER. (MT)
+    'wt_test':           22,   # WEIGHT — TEST (MT)
+    'material':          23,   # MATERIAL
+    'orientation':       24,   # ORIENTATION (V/H)
+    'unit_cost':         25,   # UNIT COST (MYR)           (green output)
+    'sub_total':         26,   # SUB TOTAL (MYR) — "Total Cost" (green output)
+    'project':           28,   # NAME OF PROJECT
+    'year':              29,   # YEAR
+}
+
+@st.cache_data
+def load_and_clean_heat_exchangers(file):
+    """Loads and cleans the Heat Exchanger workbook using the column index map above."""
+    raw = pd.read_excel(file, sheet_name=HX_SHEET_NAME, header=None, skiprows=4)
+    df = raw.copy()
+
+    df['equip_no'] = df[HX_COL_MAP['equip_no']]
+    df['description'] = df[HX_COL_MAP['description']]
+    df['hx_type'] = df[HX_COL_MAP['hx_type']].apply(lambda x: re.sub(r'\s+', ' ', str(x).strip()) if pd.notna(x) and str(x).strip() not in ('', '-') else 'Unknown')
+
+    # Keep the raw capacity string for display (e.g. "17396 (total)"), and a cleaned
+    # numeric version (17396.0) for matching/ranking/rounding.
+    df['capacity_raw'] = df[HX_COL_MAP['capacity']]
+    df['capacity_num'] = df[HX_COL_MAP['capacity']].apply(first_num)
+
+    df['design_press'] = df[HX_COL_MAP['design_press']]
+    df['design_temp_max'] = df[HX_COL_MAP['design_temp_max']]
+    df['design_temp_min'] = df[HX_COL_MAP['design_temp_min']]
+
+    # Dimensions kept as raw strings for display (often messy, e.g. "406.4 (OD)" or "Shell: 320/ 260")
+    df['length_raw'] = df[HX_COL_MAP['length']]
+    df['width_id_raw'] = df[HX_COL_MAP['width_id']]
+    df['height_raw'] = df[HX_COL_MAP['height']]
+
+    df['wt_unit_dry_num'] = df[HX_COL_MAP['wt_unit_dry']].apply(first_num)
+    df['wt_unit_oper_num'] = df[HX_COL_MAP['wt_unit_oper']].apply(first_num)
+    df['wt_tot_dry_num'] = df[HX_COL_MAP['wt_tot_dry']].apply(first_num)
+    df['wt_tot_oper_num'] = df[HX_COL_MAP['wt_tot_oper']].apply(first_num)
+    df['wt_test_num'] = df[HX_COL_MAP['wt_test']].apply(first_num)
+
+    df['material_category'] = df[HX_COL_MAP['material']].apply(categorize_material)
+    df['orientation'] = df[HX_COL_MAP['orientation']].apply(normalize_orientation)
+
+    df['unit_cost_num'] = df[HX_COL_MAP['unit_cost']].apply(first_num)
+    df['sub_total_num'] = df[HX_COL_MAP['sub_total']].apply(first_num)
+
+    df['project'] = df[HX_COL_MAP['project']]
+    df['year'] = df[HX_COL_MAP['year']]
+
+    return df.dropna(subset=['capacity_num', 'hx_type', 'unit_cost_num'])
+
+# =====================================================================
 # 4.9 MECHANICAL (LAUNCHER) CONFIG & HELPERS
 # =====================================================================
 LAUNCHER_SHEET_NAME = 'Sheet1 (2)'
@@ -1034,6 +1108,118 @@ def filter_page():
 
 
 # =====================================================================
+# 7.8 PAGE BUILDER: MECHANICAL (HEAT EXCHANGER)
+# =====================================================================
+def heat_exchanger_page():
+    st.title("🔥 Heat Exchanger Spec & Cost Lookup")
+    st.caption("Strict historical lookup. Matches based on Type of Heat Exchanger and the closest matching Capacity "
+               "(rounded to the nearest value, not just rounded up). No interpolation — the 2 closest historical "
+               "references are shown, with the nearer one recommended.")
+
+    uploaded = st.file_uploader("Upload heat exchanger database (.xlsx)", type=["xlsx"], key="hx_up")
+
+    if uploaded is None:
+        st.info(f"Upload the heat exchanger database Excel file to begin. Expects sheet '{HX_SHEET_NAME}'.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the heat exchanger workbook..."):
+            df = load_and_clean_heat_exchangers(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    display_cols = ['equip_no', 'description', 'hx_type', 'capacity_raw',
+                     'design_press', 'design_temp_max', 'design_temp_min',
+                     'length_raw', 'width_id_raw', 'height_raw',
+                     'wt_unit_dry_num', 'wt_unit_oper_num', 'wt_test_num',
+                     'material_category', 'orientation',
+                     'unit_cost_num', 'sub_total_num', 'project', 'year']
+    display_headers = ['Equip No.', 'Description', 'Type', 'Capacity (kW)',
+                        'Design Press. (barg)', 'Design Temp Max (°C)', 'Design Temp Min (°C)',
+                        'Length', 'Width/ID', 'Height',
+                        'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)',
+                        'Material', 'Orientation',
+                        'Unit Cost (MYR)', 'Total Cost (MYR)', 'Project', 'Year']
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(df[display_cols], use_container_width=True)
+
+    st.divider()
+    st.subheader("Lookup specs & cost for a new heat exchanger")
+
+    type_options = sorted(df['hx_type'].astype(str).unique())
+
+    # Placeholder types for future reference — not yet present in the historical database
+    PLACEHOLDER_HX_TYPES = ['PLATE', 'OTHER']
+    for placeholder in PLACEHOLDER_HX_TYPES:
+        if placeholder not in type_options:
+            type_options.append(placeholder)
+    type_options = sorted(type_options)
+
+    with st.form("hx_prediction_form"):
+        st.markdown("**Search Parameters**")
+        c1, c2 = st.columns(2)
+        with c1: user_capacity = st.number_input("Selection Capacity (kW)", min_value=1.0, value=1000.0, step=50.0)
+        with c2: user_type = st.selectbox("Type of Heat Exchanger", type_options)
+
+        submitted = st.form_submit_button("Lookup Existing Data", use_container_width=True, type="primary")
+
+    if submitted:
+        # Special check for PLATE / OTHER placeholders
+        if user_type in PLACEHOLDER_HX_TYPES and len(df[df['hx_type'] == user_type]) == 0:
+            st.warning(f"⚠️ '{user_type}' heat exchangers are currently unavailable in the historical database. "
+                       f"Please select another type.")
+            st.stop()
+
+        # Step 1: Filter by exact Type match
+        type_filtered = df[df['hx_type'] == user_type].copy()
+
+        if len(type_filtered) == 0:
+            st.error(f"No historical data found for '{user_type}' heat exchangers.")
+            st.stop()
+
+        # Step 2: Round to the NEAREST capacity (up or down, whichever is closer) —
+        # then take the 2 closest historical rows by absolute capacity distance.
+        type_filtered['capacity_distance'] = (type_filtered['capacity_num'] - user_capacity).abs()
+        ranked = type_filtered.sort_values('capacity_distance').reset_index(drop=True)
+
+        n_refs = min(2, len(ranked))
+        two_refs = ranked.iloc[:n_refs].copy()
+        nearest = two_refs.iloc[0]
+
+        st.info(f"Requested capacity: **{user_capacity:,.1f} kW**. Rounded to nearest available historical "
+                f"capacity: **{nearest['capacity_num']:,.1f} kW** (Equip No. {nearest['equip_no']}).")
+
+        # Display the results
+        st.markdown("### 🎯 Closest Historical Matches")
+        if n_refs < 2:
+            st.warning("Only 1 historical record exists for this Type — showing the single available reference.")
+
+        res_df = two_refs[display_cols].copy()
+        res_df.columns = display_headers
+        res_df.insert(0, 'Match', ['Closest'] + (['2nd Closest'] if n_refs > 1 else []))
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+        # Below the table: show Unit Cost, Total Cost, Unit Operating Weight for both references,
+        # with the closest (rank 0) one flagged as the recommended value.
+        st.markdown("### Recommended Output (Closest Match Highlighted)")
+
+        ref_cols = st.columns(n_refs)
+        for i, (_, row) in enumerate(two_refs.iterrows()):
+            with ref_cols[i]:
+                label = "✅ Recommended (Closest)" if i == 0 else "Reference (2nd Closest)"
+                st.markdown(f"**{label}**")
+                st.caption(f"{row['equip_no']} — {row['capacity_raw']} kW")
+                st.metric("Unit Cost (MYR)", f"{row['unit_cost_num']:,.2f}")
+                st.metric("Total Cost (MYR)", f"{row['sub_total_num']:,.2f}" if pd.notna(row['sub_total_num']) else "N/A")
+                st.metric("Unit Dry Weight (MT)", f"{row['wt_unit_dry_num']:,.2f}" if pd.notna(row['wt_unit_dry_num']) else "N/A")
+                st.metric("Unit Operating Weight (MT)", f"{row['wt_unit_oper_num']:,.2f}" if pd.notna(row['wt_unit_oper_num']) else "N/A")
+
+        st.success(f"**Recommendation:** Use the values from **{nearest['equip_no']}** "
+                   f"(capacity distance of {nearest['capacity_distance']:,.1f} kW from your input) as the closest historical match.")
+
+# =====================================================================
 # 7.9 PAGE BUILDER: MECHANICAL (LAUNCHER)
 # =====================================================================
 def launcher_page():
@@ -1252,6 +1438,7 @@ PAGES = {
     "Mechanical (Vessel)": mechanical_page, 
     "Mechanical (Tank)": tank_page,
     "Mechanical (Filter)": filter_page,
+    "Mechanical (Heat Exchanger)": heat_exchanger_page,
     "Mechanical (Launcher)": launcher_page,
     "Piping (Valve)": piping_page,         
 }
