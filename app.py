@@ -257,9 +257,11 @@ HX_SHEET_NAME = 'Sheet1 (2)'
 # "Overall_Heat_Exchanger_Database_Rev1.xlsx" / sheet 'Sheet1 (2)'.
 HX_COL_MAP = {
     'equip_no':          1,    # EQUIPMENT NO. (BED)
+    'qty':               2,    # QTY
     'description':       3,    # DESCRIPTION
     'hx_type':           6,    # TYPE OF HEAT EXCHANGER  (blue input)
     'capacity':          7,    # CAPACITY (kW)           (blue input)
+    'power_unit_duty':   8,    # POWER/UNIT — DUTY (kW)
     'design_press':      10,   # DESIGN CONDITIONS — PRESS. (barg)
     'design_temp_max':   11,   # DESIGN CONDITIONS — TEMP. Max (oC)
     'design_temp_min':   12,   # DESIGN CONDITIONS — TEMP. Min (oC)
@@ -302,6 +304,11 @@ def load_and_clean_heat_exchangers(file):
     df['length_raw'] = df[HX_COL_MAP['length']]
     df['width_id_raw'] = df[HX_COL_MAP['width_id']]
     df['height_raw'] = df[HX_COL_MAP['height']]
+    df['qty'] = df[HX_COL_MAP['qty']].apply(first_num)
+    # Kept exactly as-is (no cleaning/rounding) since these often carry qualifying text
+    # like "2 x 50% config." or "1 bay" / "(3 x 33%) 11.0 (each fan motor)".
+    df['qty_raw'] = df[HX_COL_MAP['qty']]
+    df['power_unit_duty_raw'] = df[HX_COL_MAP['power_unit_duty']]
 
     df['wt_unit_dry_num'] = df[HX_COL_MAP['wt_unit_dry']].apply(first_num)
     df['wt_unit_oper_num'] = df[HX_COL_MAP['wt_unit_oper']].apply(first_num)
@@ -1129,13 +1136,13 @@ def heat_exchanger_page():
         st.error(f"Error processing workbook: {e}")
         st.stop()
 
-    display_cols = ['equip_no', 'description', 'hx_type', 'capacity_raw',
+    display_cols = ['equip_no', 'qty_raw', 'description', 'hx_type', 'capacity_raw', 'power_unit_duty_raw',
                      'design_press', 'design_temp_max', 'design_temp_min',
                      'length_raw', 'width_id_raw', 'height_raw',
                      'wt_unit_dry_num', 'wt_unit_oper_num', 'wt_test_num',
                      'material_category', 'orientation',
                      'unit_cost_num', 'sub_total_num', 'project', 'year']
-    display_headers = ['Equip No.', 'Description', 'Type', 'Capacity (kW)',
+    display_headers = ['Equip No.', 'Quantity', 'Description', 'Type', 'Capacity (kW)', 'Power/Unit (kW)',
                         'Design Press. (barg)', 'Design Temp Max (°C)', 'Design Temp Min (°C)',
                         'Length', 'Width/ID', 'Height',
                         'Dry Wt (MT)', 'Oper. Wt (MT)', 'Test Wt (MT)',
@@ -1179,36 +1186,70 @@ def heat_exchanger_page():
             st.error(f"No historical data found for '{user_type}' heat exchangers.")
             st.stop()
 
-        # Step 2: Round to the NEAREST capacity (up or down, whichever is closer) —
-        # then take the 2 closest historical rows by absolute capacity distance.
-        type_filtered['capacity_distance'] = (type_filtered['capacity_num'] - user_capacity).abs()
-        ranked = type_filtered.sort_values('capacity_distance').reset_index(drop=True)
+        # Step 2: Compare the input capacity AGAINST the historical database by bracketing —
+        # find the historical record immediately BELOW and the one immediately ABOVE the
+        # input, so the comparison happens *in between* two real historical data points
+        # (rather than just picking the 2 absolute-nearest rows). The recommendation still
+        # always favors the bigger (upper) value, consistent with the original convention.
+        type_filtered = type_filtered.sort_values('capacity_num').reset_index(drop=True)
 
-        n_refs = min(2, len(ranked))
-        two_refs = ranked.iloc[:n_refs].copy()
-        nearest = two_refs.iloc[0]
+        lower_matches = type_filtered[type_filtered['capacity_num'] <= user_capacity]
+        upper_matches = type_filtered[type_filtered['capacity_num'] >= user_capacity]
 
-        st.info(f"Requested capacity: **{user_capacity:,.1f} kW**. Rounded to nearest available historical "
-                f"capacity: **{nearest['capacity_num']:,.1f} kW** (Equip No. {nearest['equip_no']}).")
+        lower_row = lower_matches.iloc[-1] if len(lower_matches) > 0 else None
+        upper_row = upper_matches.iloc[0] if len(upper_matches) > 0 else None
+
+        exact_match = (lower_row is not None and upper_row is not None
+                       and lower_row['capacity_num'] == upper_row['capacity_num'])
+
+        if exact_match:
+            two_refs = type_filtered.loc[[lower_row.name]].copy()
+            recommended_name = lower_row.name
+            st.success(f"Exact historical match found at **{lower_row['capacity_num']:,.1f} kW** "
+                       f"(Equip No. {lower_row['equip_no']}).")
+        elif lower_row is not None and upper_row is not None:
+            # Input falls strictly BETWEEN two historical capacities
+            two_refs = type_filtered.loc[[lower_row.name, upper_row.name]].copy()
+            recommended_name = upper_row.name
+            st.info(f"Requested capacity **{user_capacity:,.1f} kW** falls between historical capacities "
+                    f"**{lower_row['capacity_num']:,.1f} kW** ({lower_row['equip_no']}) and "
+                    f"**{upper_row['capacity_num']:,.1f} kW** ({upper_row['equip_no']}).")
+        elif upper_row is not None:
+            # Input is smaller than every historical record — no lower reference exists
+            two_refs = upper_matches.iloc[:2].copy()
+            recommended_name = upper_row.name
+            st.warning(f"Requested capacity **{user_capacity:,.1f} kW** is smaller than every historical record "
+                       f"for '{user_type}'. No smaller reference exists — recommending the closest bigger value.")
+        else:
+            # Input is bigger than every historical record — no bigger reference exists
+            two_refs = lower_matches.iloc[-2:].copy()
+            recommended_name = lower_row.name
+            st.warning(f"Requested capacity **{user_capacity:,.1f} kW** exceeds every historical record "
+                       f"for '{user_type}'. No bigger value is available — recommending the largest historical "
+                       f"reference instead.")
+
+        n_refs = len(two_refs)
+        recommended = type_filtered.loc[recommended_name]
 
         # Display the results
-        st.markdown("### 🎯 Closest Historical Matches")
+        st.markdown("### 🎯 Historical Matches (Compared Between Database Values)")
         if n_refs < 2:
-            st.warning("Only 1 historical record exists for this Type — showing the single available reference.")
+            st.caption("Only 1 historical record exists for this Type — showing the single available reference.")
 
         res_df = two_refs[display_cols].copy()
         res_df.columns = display_headers
-        res_df.insert(0, 'Match', ['Closest'] + (['2nd Closest'] if n_refs > 1 else []))
+        res_df.insert(0, 'Match', ["✅ Recommended (Bigger)" if idx == recommended_name else "Reference"
+                                    for idx in two_refs.index])
         st.dataframe(res_df, use_container_width=True, hide_index=True)
 
         # Below the table: show Unit Cost, Total Cost, Unit Operating Weight for both references,
-        # with the closest (rank 0) one flagged as the recommended value.
-        st.markdown("### Recommended Output (Closest Match Highlighted)")
+        # with the recommended (bigger-value) one flagged.
+        st.markdown("### Recommended Output (Bigger Value Highlighted)")
 
         ref_cols = st.columns(n_refs)
-        for i, (_, row) in enumerate(two_refs.iterrows()):
+        for i, (idx, row) in enumerate(two_refs.iterrows()):
             with ref_cols[i]:
-                label = "✅ Recommended (Closest)" if i == 0 else "Reference (2nd Closest)"
+                label = "✅ Recommended (Bigger Value)" if idx == recommended_name else "Reference"
                 st.markdown(f"**{label}**")
                 st.caption(f"{row['equip_no']} — {row['capacity_raw']} kW")
                 st.metric("Unit Cost (MYR)", f"{row['unit_cost_num']:,.2f}")
@@ -1216,8 +1257,8 @@ def heat_exchanger_page():
                 st.metric("Unit Dry Weight (MT)", f"{row['wt_unit_dry_num']:,.2f}" if pd.notna(row['wt_unit_dry_num']) else "N/A")
                 st.metric("Unit Operating Weight (MT)", f"{row['wt_unit_oper_num']:,.2f}" if pd.notna(row['wt_unit_oper_num']) else "N/A")
 
-        st.success(f"**Recommendation:** Use the values from **{nearest['equip_no']}** "
-                   f"(capacity distance of {nearest['capacity_distance']:,.1f} kW from your input) as the closest historical match.")
+        st.success(f"**Recommendation:** Use the values from **{recommended['equip_no']}** "
+                   f"at **{recommended['capacity_num']:,.1f} kW** — the bigger of the two compared values.")
 
 # =====================================================================
 # 7.9 PAGE BUILDER: MECHANICAL (LAUNCHER)
