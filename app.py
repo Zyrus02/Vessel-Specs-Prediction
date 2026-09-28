@@ -328,6 +328,91 @@ def load_and_clean_heat_exchangers(file):
     return df.dropna(subset=['capacity_num', 'hx_type', 'unit_cost_num'])
 
 # =====================================================================
+# 4.85 MECHANICAL (TOTE TANK) CONFIG & HELPERS
+# Input (blue-highlighted): Capacity (m3) + Selection Material
+# Output (green-highlighted): Unit Cost (MYR)
+# Match logic: filter to capacity >= input (exact or higher), then narrow to
+# only the LATEST year among that filtered subset, and show every row that
+# still qualifies (no single nearest-neighbor pick).
+# =====================================================================
+TOTE_SHEET_NAME = 'Sheet1 (2)'
+
+# Column positions (0-indexed, after skiprows=4) matching
+# "Overall_Tote_Tank_Database_Rev1.xlsx" / sheet 'Sheet1 (2)'.
+TOTE_COL_MAP = {
+    'equip_no':          1,    # EQUIPMENT NO. (BED)
+    'qty':               2,    # QTY
+    'description':       3,    # DESCRIPTION
+    'capacity':          6,    # CAPACITY (m3)              (blue input)
+    'power_unit_duty':   7,    # POWER/UNIT — DUTY (kW)
+    'power_unit_abs':    8,    # POWER/UNIT — ABSORBED (kW)
+    'design_press':      9,    # DESIGN CONDITIONS — PRESS.
+    'design_temp_max':   10,   # DESIGN CONDITIONS — TEMP. Max (oC)
+    'design_temp_min':   11,   # DESIGN CONDITIONS — TEMP. Min (oC)
+    'oper_press':        12,   # OPERATING CONDITIONS — PRESS.
+    'oper_temp':         13,   # OPERATING CONDITIONS — TEMP.
+    'length':            14,   # DIMENSIONS/UNIT — LENGTH (mm)
+    'width_id':          15,   # DIMENSIONS/UNIT — WIDTH/ID (mm)
+    'height':            16,   # DIMENSIONS/UNIT — HEIGHT (mm)
+    'wt_unit_dry':       17,   # WEIGHT — UNIT DRY (MT)
+    'wt_unit_oper':      18,   # WEIGHT — UNIT OPER. (MT)
+    'wt_tot_dry':        19,   # WEIGHT — TOT. DRY (MT)
+    'wt_tot_oper':       20,   # WEIGHT — TOT. OPER. (MT)
+    'wt_test':           21,   # WEIGHT — TEST (MT)
+    'material':          22,   # SELECTION MATERIAL         (blue input)
+    'material_detail':   23,   # MATERIAL DETAIL
+    'orientation':       24,   # ORIENTATION (V/H)
+    'unit_cost':         25,   # UNIT COST (MYR)            (green output)
+    'sub_total':         26,   # SUB TOTAL (MYR)
+    'project':           28,   # NAME OF PROJECT
+    'year':              29,   # YEAR
+}
+
+@st.cache_data
+def load_and_clean_tote_tanks(file):
+    """Loads and cleans the Tote Tank workbook using the column index map above."""
+    raw = pd.read_excel(file, sheet_name=TOTE_SHEET_NAME, header=None, skiprows=4)
+    df = raw.copy()
+
+    df['equip_no'] = df[TOTE_COL_MAP['equip_no']]
+    df['qty_raw'] = df[TOTE_COL_MAP['qty']]
+    df['description'] = df[TOTE_COL_MAP['description']]
+
+    df['capacity_raw'] = df[TOTE_COL_MAP['capacity']]
+    df['capacity_num'] = df[TOTE_COL_MAP['capacity']].apply(first_num)
+
+    df['power_unit_duty_raw'] = df[TOTE_COL_MAP['power_unit_duty']]
+    df['power_unit_abs_raw'] = df[TOTE_COL_MAP['power_unit_abs']]
+
+    df['design_press'] = df[TOTE_COL_MAP['design_press']]
+    df['design_temp_max'] = df[TOTE_COL_MAP['design_temp_max']]
+    df['design_temp_min'] = df[TOTE_COL_MAP['design_temp_min']]
+    df['oper_press'] = df[TOTE_COL_MAP['oper_press']]
+    df['oper_temp'] = df[TOTE_COL_MAP['oper_temp']]
+
+    df['length_raw'] = df[TOTE_COL_MAP['length']]
+    df['width_id_raw'] = df[TOTE_COL_MAP['width_id']]
+    df['height_raw'] = df[TOTE_COL_MAP['height']]
+
+    df['wt_unit_dry_num'] = df[TOTE_COL_MAP['wt_unit_dry']].apply(first_num)
+    df['wt_unit_oper_num'] = df[TOTE_COL_MAP['wt_unit_oper']].apply(first_num)
+    df['wt_tot_dry_num'] = df[TOTE_COL_MAP['wt_tot_dry']].apply(first_num)
+    df['wt_tot_oper_num'] = df[TOTE_COL_MAP['wt_tot_oper']].apply(first_num)
+    df['wt_test_num'] = df[TOTE_COL_MAP['wt_test']].apply(first_num)
+
+    df['material_category'] = df[TOTE_COL_MAP['material']].apply(categorize_material)
+    df['material_detail'] = df[TOTE_COL_MAP['material_detail']]
+    df['orientation'] = df[TOTE_COL_MAP['orientation']].apply(normalize_orientation)
+
+    df['unit_cost_num'] = df[TOTE_COL_MAP['unit_cost']].apply(first_num)
+    df['sub_total_num'] = df[TOTE_COL_MAP['sub_total']].apply(first_num)
+
+    df['project'] = df[TOTE_COL_MAP['project']]
+    df['year_num'] = df[TOTE_COL_MAP['year']].apply(first_num)
+
+    return df.dropna(subset=['capacity_num', 'material_category', 'unit_cost_num', 'year_num'])
+
+# =====================================================================
 # 4.9 MECHANICAL (LAUNCHER) CONFIG & HELPERS
 # =====================================================================
 LAUNCHER_SHEET_NAME = 'Sheet1 (2)'
@@ -831,7 +916,7 @@ def piping_page():
 # 7.5 PAGE BUILDER: TANKS
 # =====================================================================
 def tank_page():
-    st.title("🛢️ Tank Weight & Cost Predictor")
+    st.title("Tank Weight & Cost Predictor")
     st.caption("Computes Rectangular Volume & Area... (Operating Weight dynamically calculated by Density. Cost interpolated strictly by Area/Weight using historical matches.)")
 
     uploaded = st.file_uploader("Upload tank database (.xlsx)", type=["xlsx"], key="tank_up")
@@ -1118,7 +1203,7 @@ def filter_page():
 # 7.8 PAGE BUILDER: MECHANICAL (HEAT EXCHANGER)
 # =====================================================================
 def heat_exchanger_page():
-    st.title("🔥 Heat Exchanger Spec & Cost Lookup")
+    st.title("Heat Exchanger Spec & Cost Lookup")
     st.caption("Strict historical lookup. Matches based on Type of Heat Exchanger and the closest matching Capacity "
                "(rounded to the nearest value, not just rounded up). No interpolation — the 2 closest historical "
                "references are shown, with the nearer one recommended.")
@@ -1259,6 +1344,113 @@ def heat_exchanger_page():
 
         st.success(f"**Recommendation:** Use the values from **{recommended['equip_no']}** "
                    f"at **{recommended['capacity_num']:,.1f} kW** — the bigger of the two compared values.")
+
+# =====================================================================
+# 7.85 PAGE BUILDER: MECHANICAL (TOTE TANK)
+# =====================================================================
+def tote_tank_page():
+    st.title("Tote Tank Spec & Cost Lookup")
+    st.caption("Historical lookup filtered by Capacity (exact or higher only) and Material, then narrowed down "
+               "to the LATEST project year among the qualifying records. Every row that still meets both "
+               "conditions is shown — no single nearest-neighbor pick.")
+
+    uploaded = st.file_uploader("Upload tote tank database (.xlsx)", type=["xlsx"], key="tote_up")
+
+    if uploaded is None:
+        st.info(f"Upload the tote tank database Excel file to begin. Expects sheet '{TOTE_SHEET_NAME}'.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the tote tank workbook..."):
+            df = load_and_clean_tote_tanks(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    display_cols = ['equip_no', 'qty_raw', 'description', 'capacity_raw',
+                     'power_unit_duty_raw', 'power_unit_abs_raw',
+                     'design_press', 'design_temp_max', 'design_temp_min',
+                     'oper_press', 'oper_temp',
+                     'length_raw', 'width_id_raw', 'height_raw',
+                     'wt_unit_dry_num', 'wt_unit_oper_num', 'wt_tot_dry_num', 'wt_tot_oper_num', 'wt_test_num',
+                     'material_category', 'material_detail', 'orientation',
+                     'unit_cost_num', 'sub_total_num', 'project', 'year_num']
+    display_headers = ['Equip No.', 'Quantity', 'Description', 'Capacity (m³)',
+                        'Power/Unit Duty (kW)', 'Power/Unit Absorbed (kW)',
+                        'Design Press.', 'Design Temp Max (°C)', 'Design Temp Min (°C)',
+                        'Oper. Press.', 'Oper. Temp (°C)',
+                        'Length', 'Width/ID', 'Height',
+                        'Dry Wt (MT)', 'Oper. Wt (MT)', 'Tot. Dry Wt (MT)', 'Tot. Oper. Wt (MT)', 'Test Wt (MT)',
+                        'Material', 'Material Detail', 'Orientation',
+                        'Unit Cost (MYR)', 'Total Cost (MYR)', 'Project', 'Year']
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(df[display_cols], use_container_width=True)
+
+    st.divider()
+    st.subheader("Lookup specs & cost for a new tote tank")
+
+    material_options = sorted(df['material_category'].astype(str).unique())
+
+    # Placeholder material for future reference — not yet present in the historical database
+    PLACEHOLDER_TOTE_MATERIALS = ['CS']
+    for placeholder in PLACEHOLDER_TOTE_MATERIALS:
+        if placeholder not in material_options:
+            material_options.append(placeholder)
+    material_options = [AUTO_OPTION] + sorted(material_options)
+
+    with st.form("tote_prediction_form"):
+        st.markdown("**Search Parameters**")
+        c1, c2 = st.columns(2)
+        with c1: user_capacity = st.number_input("Minimum Capacity (m³)", min_value=0.1, value=2.0, step=0.5)
+        with c2: user_material = st.selectbox("Selection Material", material_options)
+
+        submitted = st.form_submit_button("Lookup Existing Data", use_container_width=True, type="primary")
+
+    if submitted:
+        # Special check for placeholder materials (e.g. CS) with no historical data yet
+        if user_material in PLACEHOLDER_TOTE_MATERIALS and len(df[df['material_category'] == user_material]) == 0:
+            st.warning(f"⚠️ '{user_material}' tote tanks are currently unavailable in the historical database. "
+                       f"Please select another material.")
+            st.stop()
+
+        # Condition 1: exact or higher capacity value
+        capacity_filtered = df[df['capacity_num'] >= user_capacity].copy()
+
+        # Optional material filter (blue input)
+        if user_material != AUTO_OPTION:
+            capacity_filtered = capacity_filtered[capacity_filtered['material_category'] == user_material]
+
+        if len(capacity_filtered) == 0:
+            st.error(f"No historical tote tanks found with capacity ≥ {user_capacity:,.2f} m³"
+                      + (f" and material '{user_material}'." if user_material != AUTO_OPTION else "."))
+            st.stop()
+
+        # Condition 2: narrow down to the LATEST year among the capacity-filtered subset
+        latest_year = capacity_filtered['year_num'].max()
+        final_matches = capacity_filtered[capacity_filtered['year_num'] == latest_year].copy()
+        final_matches = final_matches.sort_values('capacity_num').reset_index(drop=True)
+
+        st.info(f"Filtered to capacity ≥ **{user_capacity:,.2f} m³**"
+                + (f", material **{user_material}**" if user_material != AUTO_OPTION else "")
+                + f", then narrowed to the latest project year found: **{int(latest_year)}**. "
+                f"**{len(final_matches)}** historical record(s) match all conditions.")
+
+        st.markdown("### 🎯 Historical Matches (All Qualifying Records)")
+        res_df = final_matches[display_cols].copy()
+        res_df.columns = display_headers
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### 💰 Output Summary — Unit Cost (MYR)")
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Lowest Unit Cost", f"{final_matches['unit_cost_num'].min():,.2f}")
+        s2.metric("Highest Unit Cost", f"{final_matches['unit_cost_num'].max():,.2f}")
+        s3.metric("Average Unit Cost", f"{final_matches['unit_cost_num'].mean():,.2f}")
+
+        st.markdown("### ⚖️ Output Summary — Unit Dry Weight & Unit Test Weight (MT)")
+        weight_df = final_matches[['equip_no', 'wt_unit_dry_num', 'wt_test_num']].copy()
+        weight_df.columns = ['Equip No.', 'Unit Dry Weight (MT)', 'Unit Test Weight (MT)']
+        st.dataframe(weight_df, use_container_width=True, hide_index=True)
 
 # =====================================================================
 # 7.9 PAGE BUILDER: MECHANICAL (LAUNCHER)
@@ -1480,6 +1672,7 @@ PAGES = {
     "Mechanical (Tank)": tank_page,
     "Mechanical (Filter)": filter_page,
     "Mechanical (Heat Exchanger)": heat_exchanger_page,
+    "Mechanical (Tote Tank)": tote_tank_page,
     "Mechanical (Launcher)": launcher_page,
     "Piping (Valve)": piping_page,         
 }
