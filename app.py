@@ -2349,8 +2349,8 @@ PAGES = {
     "Mechanical (Heat Exchanger)": heat_exchanger_page,
     "Mechanical (Tote Tank)": tote_tank_page,
     "Mechanical (Launcher)": launcher_page,
-    "Package": package_page,
-    "Pump": pump_page,
+    "Mechanical (Package)": package_page,
+    "Mechanical (Pump)": pump_page,
     "Piping (Valve)": piping_page,         
 }
 
