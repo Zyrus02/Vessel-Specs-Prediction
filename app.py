@@ -2046,6 +2046,300 @@ def package_page():
                + (" — the bigger of the two compared values." if len(ids) > 1 else "."))
 
 # =====================================================================
+# 7.97 PUMP (DISCIPLINE) CONFIG & HELPERS
+# Inputs : Type of Pump (list comes from Sheet2) + Flowrate CAPACITY (m3/h) + dP CAPACITY (bar)
+# Outputs: (a) Flowrate comparison  -> closest lower & closest higher reference, bigger one proceeds
+#          (b) dP comparison        -> done among the rows that proceeded from (a), bigger one is recommended
+# =====================================================================
+PUMP_DATA_SHEET = 'Sheet1'      # pump database
+PUMP_TYPE_SHEET = 'Sheet2'      # master list of pump types (reference list)
+
+# Column positions (0-indexed, after skiprows=4) matching "Overall_Pump_Database_Rev1.xlsx" / 'Sheet1'
+PUMP_COL_MAP = {
+    'equip_no':     1,    # EQUIPMENT NO. (BED)
+    'qty':          2,    # QTY
+    'description':  3,    # DESCRIPTION
+    'pump_type':    6,    # Type of Pump
+    'flow':         7,    # Flowrate CAPACITY (m3/h)  (input)
+    'dp':           8,    # dP CAPACITY (bar)         (input)
+    'detail_cap':   9,    # Detail CAPACITY
+    'power_duty':   10,   # POWER/UNIT - DUTY (kW)
+    'power_abs':    11,   # POWER/UNIT - ABSORBED (kW)
+    'design_press': 12,   # DESIGN CONDITIONS - PRESS. (barg)
+    'design_tmax':  13,   # DESIGN CONDITIONS - TEMP. Max (oC)
+    'design_tmin':  14,   # DESIGN CONDITIONS - TEMP. Min (oC)
+    'length':       17,   # DIMENSIONS/UNIT - LENGTH (mm)
+    'width_id':     18,   # DIMENSIONS/UNIT - WIDTH/ID (mm)
+    'height':       19,   # DIMENSIONS/UNIT - HEIGHT (mm)
+    'wt_dry':       20,   # UNIT DRY (MT)
+    'wt_oper':      21,   # UNIT OPER. (MT)
+    'wt_test':      24,   # TEST (MT)
+    'material':     25,   # MATERIAL
+    'orientation':  26,   # ORIENTATION
+    'unit_cost':    27,   # UNIT COST (MYR)
+    'remarks':      29,   # REMARKS
+    'project':      30,   # NAME OF PROJECT
+    'year':         31,   # YEAR
+}
+
+# (dataframe column, header shown in the output table) - exactly the requested output columns
+PUMP_DISPLAY = [
+    ('equip_no',     'EQUIPMENT NO. (BED)'),
+    ('qty',          'QTY'),
+    ('description',  'DESCRIPTION'),
+    ('detail_cap',   'Detail CAPACITY'),
+    ('power_duty',   'POWER/UNIT - Duty (kW)'),
+    ('power_abs',    'POWER/UNIT - Absorbed (kW)'),
+    ('design_press', 'DESIGN PRESS. (barg)'),
+    ('design_tmax',  'DESIGN TEMP. Max (°C)'),
+    ('design_tmin',  'DESIGN TEMP. Min (°C)'),
+    ('length',       'LENGTH (mm)'),
+    ('width_id',     'WIDTH/ID (mm)'),
+    ('height',       'HEIGHT (mm)'),
+    ('wt_dry',       'UNIT DRY (MT)'),
+    ('wt_oper',      'UNIT OPER (MT)'),
+    ('wt_test',      'TEST (MT)'),
+    ('material',     'MATERIAL'),
+    ('orientation',  'ORIENTATION'),
+    ('unit_cost',    'UNIT COST (MYR)'),
+    ('remarks',      'REMARKS'),
+    ('project',      'NAME OF PROJECT'),
+    ('year',         'YEAR'),
+]
+
+def _pump_norm(s):
+    """Collapses repeated spaces/new-lines so 'Pump -  API 675' and 'Pump - API 675' match."""
+    return re.sub(r'\s+', ' ', str(s).strip()) if pd.notna(s) else ''
+
+@st.cache_data
+def load_and_clean_pumps(file):
+    """Loads the pump database (Sheet1) and the master pump-type list (Sheet2)."""
+    raw = pd.read_excel(file, sheet_name=PUMP_DATA_SHEET, header=None, skiprows=4)
+    df = pd.DataFrame({k: raw[i] for k, i in PUMP_COL_MAP.items()})
+
+    df['pump_type'] = df['pump_type'].apply(_pump_norm)
+    df['flow_num'] = df['flow'].apply(first_num)
+    df['dp_num'] = df['dp'].apply(first_num)
+    df['year_num'] = pd.to_numeric(df['year'], errors='coerce')
+    # Keep only real pump rows (must have a type, a flowrate and a dP to be comparable)
+    df = df[(df['pump_type'] != '') & df['flow_num'].notna() & df['dp_num'].notna()].reset_index(drop=True)
+
+    types_raw = pd.read_excel(file, sheet_name=PUMP_TYPE_SHEET, header=None)
+    master_types = [_pump_norm(t) for t in types_raw[1].dropna()
+                    if _pump_norm(t) and _pump_norm(t).lower() != 'type of pump']
+    return df, master_types
+
+def select_pump_references(type_df: pd.DataFrame, user_flow: float, user_dp: float):
+    """
+    Step a) Flowrate: find the closest LOWER and closest HIGHER flowrate reference.
+            The bigger (higher) flowrate proceeds to step b.
+    Step b) dP: among the rows at the proceeding flowrate, find the closest LOWER and
+            closest HIGHER dP. The bigger (higher) dP is the recommendation.
+    Returns a dict with the rows/indices of every stage plus plain-language notes.
+    """
+    notes = []
+    flows = sorted(type_df['flow_num'].unique())
+
+    exact_flow = user_flow in flows
+    lower_flows = [f for f in flows if f < user_flow]
+    upper_flows = [f for f in flows if f > user_flow]
+
+    if exact_flow:
+        lower_flow = upper_flow = user_flow
+        notes.append(f"Exact flowrate match at {user_flow:g} m³/h.")
+    else:
+        lower_flow = lower_flows[-1] if lower_flows else None
+        upper_flow = upper_flows[0] if upper_flows else None
+
+    if upper_flow is not None:
+        proceed_flow = upper_flow
+        if lower_flow is None:
+            notes.append(f"Flowrate {user_flow:g} m³/h is below every record for this type - no lower reference exists. "
+                         f"Proceeding with the closest bigger flowrate ({upper_flow:g} m³/h).")
+        elif not exact_flow:
+            notes.append(f"Flowrate {user_flow:g} m³/h falls between {lower_flow:g} and {upper_flow:g} m³/h. "
+                         f"The bigger value ({upper_flow:g} m³/h) proceeds to the dP comparison.")
+    else:
+        proceed_flow = lower_flow
+        notes.append(f"Flowrate {user_flow:g} m³/h exceeds every record for this type - no bigger reference exists. "
+                     f"Proceeding with the largest available flowrate ({lower_flow:g} m³/h).")
+
+    lower_flow_rows = type_df[type_df['flow_num'] == lower_flow] if lower_flow is not None else type_df.iloc[0:0]
+    upper_flow_rows = type_df[type_df['flow_num'] == upper_flow] if upper_flow is not None else type_df.iloc[0:0]
+    proceed_rows = type_df[type_df['flow_num'] == proceed_flow]
+
+    # ---- Step b: dP comparison among the rows that proceeded from step a ----
+    dps = sorted(proceed_rows['dp_num'].unique())
+    exact_dp = user_dp in dps
+    lower_dps = [d for d in dps if d < user_dp]
+    upper_dps = [d for d in dps if d > user_dp]
+
+    if exact_dp:
+        lower_dp = upper_dp = user_dp
+        notes.append(f"Exact dP match at {user_dp:g} bar.")
+    else:
+        lower_dp = lower_dps[-1] if lower_dps else None
+        upper_dp = upper_dps[0] if upper_dps else None
+
+    if upper_dp is not None:
+        rec_dp = upper_dp
+        if len(dps) == 1 and not exact_dp:
+            notes.append(f"Only one dP value ({upper_dp:g} bar) exists at {proceed_flow:g} m³/h, which is higher than the "
+                         f"requested {user_dp:g} bar - it is taken as the reference.")
+        elif lower_dp is None:
+            notes.append(f"dP {user_dp:g} bar is below every record at {proceed_flow:g} m³/h - no lower reference exists. "
+                         f"Recommending the closest bigger dP ({upper_dp:g} bar).")
+        elif not exact_dp:
+            notes.append(f"dP {user_dp:g} bar falls between {lower_dp:g} and {upper_dp:g} bar at {proceed_flow:g} m³/h. "
+                         f"The bigger value ({upper_dp:g} bar) is recommended.")
+    else:
+        rec_dp = lower_dp
+        notes.append(f"dP {user_dp:g} bar exceeds every record at {proceed_flow:g} m³/h - no bigger reference exists. "
+                     f"Recommending the largest available dP ({lower_dp:g} bar); this is BELOW the requested duty, "
+                     f"so an engineering check is required before using it.")
+
+    lower_dp_rows = proceed_rows[proceed_rows['dp_num'] == lower_dp] if lower_dp is not None else proceed_rows.iloc[0:0]
+    upper_dp_rows = proceed_rows[proceed_rows['dp_num'] == upper_dp] if upper_dp is not None else proceed_rows.iloc[0:0]
+    rec_candidates = proceed_rows[proceed_rows['dp_num'] == rec_dp]
+    # If several historical rows share the same flow & dP, take the most recent project year
+    rec_row = rec_candidates.sort_values('year_num', ascending=False, na_position='last').iloc[0]
+
+    return dict(notes=notes, lower_flow=lower_flow, upper_flow=upper_flow, proceed_flow=proceed_flow,
+                lower_flow_rows=lower_flow_rows, upper_flow_rows=upper_flow_rows,
+                lower_dp=lower_dp, upper_dp=upper_dp, rec_dp=rec_dp,
+                lower_dp_rows=lower_dp_rows, upper_dp_rows=upper_dp_rows,
+                rec_row=rec_row, n_same_spec=len(rec_candidates))
+
+def _pump_table(rows: pd.DataFrame, match_labels=None):
+    """Builds a display table with ALL requested reference columns (text-safe for Streamlit)."""
+    out = pd.DataFrame({hdr: rows[col] for col, hdr in PUMP_DISPLAY})
+    out = out.apply(lambda c: c.map(lambda v: '-' if pd.isna(v) else
+                                    (str(int(v)) if isinstance(v, float) and v.is_integer() else str(v))))
+    if match_labels is not None:
+        out.insert(0, 'Match', match_labels)
+    return out
+
+# =====================================================================
+# 7.97 PAGE BUILDER: PUMP
+# =====================================================================
+def pump_page():
+    st.title("Pump Spec & Cost Lookup")
+    st.caption("Strict historical lookup (no interpolation). Select the Type of Pump, Flowrate and dP. "
+               "Step a) the flowrate is compared against the closest lower and closest higher references - the bigger "
+               "value proceeds. Step b) the dP is compared among the references from step a) - the bigger value "
+               "is recommended.")
+
+    uploaded = st.file_uploader("Upload pump database (.xlsx)", type=["xlsx"], key="pump_up")
+    if uploaded is None:
+        st.info(f"Upload the pump database Excel file to begin. Expects sheets '{PUMP_DATA_SHEET}' (data) "
+                f"and '{PUMP_TYPE_SHEET}' (pump type list).")
+        st.stop()
+
+    try:
+        with st.spinner("Reading and cleaning the pump workbook..."):
+            df, master_types = load_and_clean_pumps(uploaded)
+    except Exception as e:
+        st.error(f"Error processing workbook: {e}")
+        st.stop()
+
+    with st.expander("Preview cleaned data"):
+        st.dataframe(_pump_table(df), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Lookup specs & cost for a new pump")
+
+    # Type list comes from Sheet2; add any type that exists in the data but not in the list
+    type_options = list(master_types)
+    for t in sorted(df['pump_type'].unique()):
+        if t not in type_options:
+            type_options.append(t)
+
+    with st.form("pump_prediction_form"):
+        st.markdown("**Search Parameters**")
+        user_type = st.selectbox("Type of Pump", type_options)
+        c1, c2 = st.columns(2)
+        with c1: user_flow = st.number_input("Flowrate CAPACITY (m³/h)", min_value=0.0, value=10.0, step=1.0, format="%.3f")
+        with c2: user_dp = st.number_input("dP CAPACITY (bar)", min_value=0.0, value=5.0, step=0.5, format="%.2f")
+        submitted = st.form_submit_button("Lookup Existing Data", use_container_width=True, type="primary")
+
+    if not submitted:
+        return
+
+    type_df = df[df['pump_type'] == user_type].copy()
+    if len(type_df) == 0:
+        st.warning(f"⚠️ '{user_type}' is unavailable at the moment - there is no historical data for this pump type. "
+                   f"Please select another type.")
+        st.stop()
+
+    res = select_pump_references(type_df, user_flow, user_dp)
+
+    # ---------------- Step a ----------------
+    st.markdown("### Flowrate comparison (closest lower & higher reference)")
+    for n in res['notes']:
+        st.info(n)
+
+    a_rows, a_labels = [], []
+    if res['lower_flow'] is not None and res['lower_flow'] != res['proceed_flow']:
+        a_rows.append(res['lower_flow_rows']); a_labels += [f"Lower flow ({res['lower_flow']:g} m³/h)"] * len(res['lower_flow_rows'])
+    a_rows.append(res['upper_flow_rows'] if res['upper_flow'] is not None else res['lower_flow_rows'])
+    a_labels += [f"✅ Bigger flow ({res['proceed_flow']:g} m³/h) → proceeds to dP"] * len(a_rows[-1])
+
+    # ---------------- Step b ----------------
+    st.markdown(f"### dP comparison at {res['proceed_flow']:g} m³/h")
+    b_rows, b_labels = [], []
+    if res['lower_dp'] is not None and res['lower_dp'] != res['rec_dp']:
+        b_rows.append(res['lower_dp_rows']); b_labels += [f"Lower dP ({res['lower_dp']:g} bar)"] * len(res['lower_dp_rows'])
+    rec_rows = res['upper_dp_rows'] if res['upper_dp'] is not None else res['lower_dp_rows']
+    b_rows.append(rec_rows); b_labels += [f"✅ Bigger dP ({res['rec_dp']:g} bar) → recommended"] * len(rec_rows)
+    st.dataframe(_pump_table(pd.concat(b_rows), b_labels), use_container_width=True, hide_index=True)
+
+    # ---------------- Recommendation ----------------
+    rec = res['rec_row']
+    st.markdown("### 🎯 Recommended Pump Specification")
+    rec_df = rec.to_frame().T
+    st.dataframe(_pump_table(rec_df), use_container_width=True, hide_index=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Unit Cost (MYR)", f"{rec['unit_cost']:,.2f}" if isinstance(rec['unit_cost'], (int, float)) and pd.notna(rec['unit_cost']) else str(rec['unit_cost']))
+    m2.metric("Unit Dry (MT)", str(rec['wt_dry']))
+    m3.metric("Unit Oper. (MT)", str(rec['wt_oper']))
+    m4.metric("Test (MT)", str(rec['wt_test']))
+
+    # ---------------- Step c: compare ALL rows similar to the recommended pump ----------------
+    similar = type_df[type_df['flow_num'] == rec['flow_num']].copy()
+    if len(similar) > 1:
+        st.markdown(f"### All similar pumps at {rec['flow_num']:g} m³/h ({len(similar)} records)")
+        st.caption("Every historical pump of this type with the same flowrate as the recommended pump, "
+                   "sorted by dP, so the specs, weights and costs can be compared side by side.")
+        similar = similar.sort_values(['dp_num', 'year_num'], ascending=[True, False])
+        rec_cost = pd.to_numeric(rec['unit_cost'], errors='coerce')
+
+        def _label(r):
+            if r.name == rec.name:
+                return "✅ Recommended"
+            if r['dp_num'] == rec['dp_num']:
+                return "Same flow & dP"
+            return "Higher dP" if r['dp_num'] > rec['dp_num'] else "Lower dP"
+
+        cmp_df = _pump_table(similar, [_label(r) for _, r in similar.iterrows()])
+        cmp_df.insert(1, 'Flowrate (m³/h)', similar['flow_num'].map(lambda v: f"{v:g}").values)
+        cmp_df.insert(2, 'dP (bar)', similar['dp_num'].map(lambda v: f"{v:g}").values)
+        costs = pd.to_numeric(similar['unit_cost'], errors='coerce')
+        cmp_df['Cost vs Recommended'] = [
+            '-' if pd.isna(c) or pd.isna(rec_cost) or rec_cost == 0 else f"{(c - rec_cost) / rec_cost * 100:+.1f}%"
+            for c in costs]
+        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
+
+        n_same = int((similar['dp_num'] == rec['dp_num']).sum())
+        if n_same > 1:
+            st.caption(f"{n_same} records share both this flowrate and dP; the most recent project year is "
+                       f"marked as recommended.")
+
+    st.success(f"**Recommendation:** Use the values from **{rec['equip_no']}** ({rec['project']}, {rec['year']}) - "
+               f"{rec['flow_num']:g} m³/h @ {rec['dp_num']:g} bar - the bigger of the compared values for "
+               f"your input of {user_flow:g} m³/h @ {user_dp:g} bar.")
+
+# =====================================================================
 # 8. NAVIGATION MENU
 # =====================================================================
 PAGES = {
@@ -2056,6 +2350,7 @@ PAGES = {
     "Mechanical (Tote Tank)": tote_tank_page,
     "Mechanical (Launcher)": launcher_page,
     "Package": package_page,
+    "Pump": pump_page,
     "Piping (Valve)": piping_page,         
 }
 
