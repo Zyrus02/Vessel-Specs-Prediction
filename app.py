@@ -1680,12 +1680,15 @@ def launcher_page():
 PACKAGE_SHEET_NAME = 'MAIN'
 PACKAGE_FIRST_DATA_ROW = 5
 PACKAGE_COLS = {
-    'equip_no': 'B', 'qty': 'C', 'description': 'D', 'package': 'G', 'capacity': 'H', 'unit': 'I',
+    'equip_no': 'B', 'qty': 'C', 'description': 'D', 'pfd': 'E', 'location': 'F',
+    'package': 'G', 'capacity': 'H', 'unit': 'I',
     'power_duty': 'J', 'power_abs': 'K',
     'design_press': 'L', 'design_temp_max': 'M', 'design_temp_min': 'N',
+    'oper_press': 'O', 'oper_temp': 'P',
     'length': 'Q', 'width': 'R', 'height': 'S',
-    'wt_unit_dry': 'T', 'wt_unit_oper': 'U', 'wt_test': 'X',
-    'material': 'Y', 'unit_cost': 'AA', 'remarks': 'AC', 'project': 'AD', 'year': 'AE',
+    'wt_unit_dry': 'T', 'wt_unit_oper': 'U', 'wt_tot_dry': 'V', 'wt_tot_oper': 'W', 'wt_test': 'X',
+    'material': 'Y', 'orientation': 'Z', 'unit_cost': 'AA', 'sub_total': 'AB',
+    'remarks': 'AC', 'project': 'AD', 'year': 'AE', 'folder': 'AF',
 }
 
 @st.cache_data
@@ -1741,8 +1744,9 @@ def load_and_clean_packages(file):
     df['year_num'] = df['year'].apply(first_num)
     df['qty_num'] = df['qty'].apply(first_num)
     df['unit_cost_num'] = df['unit_cost_raw'].apply(first_num)
+    df['sub_total_num'] = df['sub_total'].apply(first_num)
     for k in ['power_duty', 'power_abs', 'design_press', 'design_temp_max', 'design_temp_min',
-              'length', 'width', 'height', 'wt_unit_dry', 'wt_unit_oper', 'wt_test']:
+              'length', 'width', 'height', 'wt_unit_dry', 'wt_unit_oper', 'wt_tot_dry', 'wt_tot_oper', 'wt_test']:
         df[k + '_num'] = df[k].apply(first_num)
     df['material_clean'] = df['material'].apply(categorize_material)
     # Package cost: shared cost counted once; separate per-skid costs are summed
@@ -1752,14 +1756,176 @@ def load_and_clean_packages(file):
     df = df.merge(costs, left_on='group_id', right_index=True)
     return df
 
+PACKAGE_LIST_SHEET = 'LIST PACKAGE'
+
+@st.cache_data
+def load_package_list(file):
+    """Reads the master 'LIST PACKAGE' sheet -> ordered, de-duplicated (package, unit) pairs."""
+    raw = pd.read_excel(file, sheet_name=PACKAGE_LIST_SHEET, header=0)
+    raw = raw.iloc[:, 1:3]
+    raw.columns = ['package', 'unit']
+    raw = raw.dropna(subset=['package'])
+    raw['package'] = raw['package'].astype(str).str.strip().str.upper()
+    raw['unit'] = raw['unit'].apply(lambda u: str(u).strip() if pd.notna(u) else 'Unknown')
+    return raw.drop_duplicates().reset_index(drop=True)
+
+
+def _norm_unit(u):
+    """Small spelling differences (m3/h vs m3/hr) must not split a package into two units."""
+    return re.sub(r'\s+', '', str(u).strip().lower()).replace('m3/hr', 'm3/h')
+
+
 # =====================================================================
 # 7.95 PAGE BUILDER: PACKAGE
+# Match logic (same idea as Heat Exchanger): compare the requested capacity against the
+# historical database and show only the 2 closest references that BRACKET it (one at/below,
+# one at/above). The bigger one is the recommendation.
 # =====================================================================
+def select_package_references(heads: pd.DataFrame, user_capacity: float):
+    """
+    heads = one row per package record (skid 1 of each package).
+    Returns (list_of_group_ids_to_show, recommended_group_id, status).
+      status: 'exact' | 'between' | 'below_all' | 'above_all'
+    If several records share the same capacity, only the LATEST year is kept for that capacity.
+    """
+    g = heads.sort_values(['capacity_num', 'year_num', 'excel_row'], ascending=[True, False, True])
+    g = g.drop_duplicates('capacity_num', keep='first').reset_index(drop=True)
+
+    lower_m = g[g['capacity_num'] <= user_capacity]
+    upper_m = g[g['capacity_num'] >= user_capacity]
+    lower = lower_m.iloc[-1] if len(lower_m) else None
+    upper = upper_m.iloc[0] if len(upper_m) else None
+
+    if lower is not None and upper is not None and lower['capacity_num'] == upper['capacity_num']:
+        return [lower['group_id']], lower['group_id'], 'exact'
+    if lower is not None and upper is not None:
+        return [lower['group_id'], upper['group_id']], upper['group_id'], 'between'
+    if upper is not None:      # requested capacity is smaller than everything in the database
+        return upper_m['group_id'].iloc[:2].tolist(), upper['group_id'], 'below_all'
+    # requested capacity is bigger than everything in the database
+    return lower_m['group_id'].iloc[-2:].tolist(), lower['group_id'], 'above_all'
+
+
+def _pfmt(v, d=2):
+    return f"{v:,.{d}f}" if pd.notna(v) else "n/a"
+
+
+def _wsum(g, col):
+    """Sum of a weight column across skids (NaN if no skid has a value)."""
+    s = pd.to_numeric(g[col], errors='coerce').sum(min_count=1)
+    return s
+
+
+def _package_totals(g):
+    """Package-level totals used in both the comparison table and the detail section."""
+    head = g.iloc[0]
+    n = int(head['n_skids'])
+    qty = head['qty_num'] if pd.notna(head['qty_num']) else 1
+    if n == 1:
+        if pd.notna(head['sub_total_num']):
+            cost = head['sub_total_num']                       # SUB TOTAL as recorded in the database
+        else:
+            cost = head['package_cost'] * qty if pd.notna(head['package_cost']) else float('nan')
+    else:
+        cost = head['package_cost']   # multi-skid: shared cost, or sum of per-skid costs
+    return dict(n=n, qty=qty, cost=cost,
+                dry=_wsum(g, 'wt_unit_dry_num'), oper=_wsum(g, 'wt_unit_oper_num'), test=_wsum(g, 'wt_test_num'))
+
+
+# (label, dataframe column, was green-highlighted in the Excel database, money?)
+DB_FIELDS = [
+    ('Equip No.', 'equip_no', True, False), ('Qty', 'qty', True, False), ('Description', 'description', True, False),
+    ('PFD / UFD No.', 'pfd', False, False), ('Location', 'location', False, False),
+    ('List of Package', 'package', False, False), ('Capacity', 'capacity', False, False), ('Unit', 'unit', False, False),
+    ('Power/Unit Duty (kW)', 'power_duty', True, False), ('Power/Unit Absorbed (kW)', 'power_abs', True, False),
+    ('Design Press. (barg)', 'design_press', True, False), ('Design Temp Max (°C)', 'design_temp_max', True, False),
+    ('Design Temp Min (°C)', 'design_temp_min', True, False),
+    ('Oper. Press. (barg)', 'oper_press', False, False), ('Oper. Temp (°C)', 'oper_temp', False, False),
+    ('Length (mm)', 'length', True, False), ('Width/ID (mm)', 'width', True, False), ('Height (mm)', 'height', True, False),
+    ('Unit Dry (MT)', 'wt_unit_dry', False, False), ('Unit Oper. (MT)', 'wt_unit_oper', False, False),
+    ('Tot. Dry (MT)', 'wt_tot_dry', False, False), ('Tot. Oper. (MT)', 'wt_tot_oper', False, False),
+    ('Test (MT)', 'wt_test', False, False),
+    ('Material', 'material', True, False), ('Orientation', 'orientation', False, False),
+    ('Unit Cost (MYR)', 'unit_cost', True, True), ('Sub Total (MYR)', 'sub_total', False, True),
+    ('Remarks', 'remarks', False, False), ('Project', 'project', False, False),
+    ('Year', 'year', True, False), ('Folder', 'folder', False, False),
+]
+
+
+def _disp(v, money=False):
+    """Show a database cell as recorded (text stays text, numbers tidied, blanks empty)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ''
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return f"{v:,.2f}" if money else (f"{int(v)}" if float(v).is_integer() else f"{round(v, 4):g}")
+    return str(v).strip()
+
+
+def _db_values(r):
+    """{label: value} for ALL database columns of one skid row."""
+    out = {}
+    for label, key, _, money in DB_FIELDS:
+        v = r[key]
+        if key in ('unit_cost', 'sub_total') and bool(r['cost_shared']) and int(r['skid_no']) > 1:
+            v = '(shared with Skid 1)'      # merged cell in Excel: one cost for the whole package
+        out[label] = _disp(v, money)
+    return out
+
+
+def _render_skid_metrics(r):
+    """Weights, then dimensions, of one skid."""
+    w1, w2, w3 = st.columns(3)
+    w1.metric("Unit Dry (MT)", _pfmt(r['wt_unit_dry_num']))
+    w2.metric("Unit Operating (MT)", _pfmt(r['wt_unit_oper_num']))
+    w3.metric("Test (MT)", _pfmt(r['wt_test_num']))
+    st.markdown("**📏 Dimensions (mm)**")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Length", _pfmt(r['length_num'], 0))
+    d2.metric("Width / ID", _pfmt(r['width_num'], 0))
+    d3.metric("Height", _pfmt(r['height_num'], 0))
+
+
+def _render_package_metrics(g, heading):
+    head = g.iloc[0]
+    t = _package_totals(g)
+    n = t['n']
+    st.markdown(f"### {heading}")
+    st.caption(f"{head['equip_no']} — {head['description']} · {head['capacity_num']:g} {head['unit_clean']} · "
+               f"{head['project']} ({int(head['year_num'])})" + (f" · {n} skids" if n > 1 else ""))
+
+    if n == 1:
+        _render_skid_metrics(head)
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Unit Cost (MYR)", _pfmt(head['package_cost']))
+        k2.metric("Quantity", f"{t['qty']:g}")
+        k3.metric("Total Cost (MYR)", _pfmt(t['cost']))
+        return
+
+    # Multi-skid: Skid 1, Skid 2, ... each with its weights and dimensions, then the package total
+    for _, r in g.iterrows():
+        st.markdown(f"#### Skid {int(r['skid_no'])} — {r['equip_no']} · {r['description']}")
+        _render_skid_metrics(r)
+        if not head['cost_shared']:
+            st.metric(f"Skid {int(r['skid_no'])} Unit Cost (MYR)", _pfmt(r['unit_cost_num']))
+        st.markdown("---")
+
+    st.markdown("#### 📦 Package Total")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Package Total Cost (MYR)", _pfmt(t['cost']))
+    p2.metric("Total Unit Dry (MT)", _pfmt(t['dry']))
+    p3.metric("Total Unit Operating (MT)", _pfmt(t['oper']))
+    p4.metric("Total Test (MT)", _pfmt(t['test']))
+    st.caption(("One cost covers all skids (merged cell in Excel). " if head['cost_shared']
+                else "Each skid has its own unit cost; package cost is their sum. ")
+               + "Package weights are the sum of the skids' unit weights. Quantity is not applied to multi-skid packages.")
+
+
 def package_page():
     st.title("Package Spec & Cost Lookup")
-    st.caption("Filtered by List of Package and Capacity (exact or higher only), then narrowed to the LATEST "
-               "project year. Packages made of several skids (merged rows in Excel, e.g. AGRU) are shown "
-               "skid-by-skid with a separate package total.")
+    st.caption("Filtered by List of Package, then the requested Capacity is compared against the historical "
+               "database. The 2 closest references (one at/below, one at/above) are shown and the bigger one is "
+               "recommended. Packages made of several skids (merged rows in Excel, e.g. AGRU) are shown "
+               "with one row per skid, followed by a package total row.")
 
     uploaded = st.file_uploader("Upload package database (.xlsx)", type=["xlsx"], key="pkg_up")
     if uploaded is None:
@@ -1772,12 +1938,6 @@ def package_page():
         st.error(f"Error processing workbook: {e}")
         st.stop()
 
-    skid_cols = ['equip_no', 'description', 'skid_no', 'qty_num', 'power_duty_num', 'power_abs_num',
-                 'design_press_num', 'design_temp_max_num', 'design_temp_min_num',
-                 'length_num', 'width_num', 'height_num', 'material_clean']
-    skid_heads = ['Equip No.', 'Description', 'Skid', 'Qty', 'Duty (kW)', 'Absorbed (kW)',
-                  'Design Press. (barg)', 'Design Temp Max (°C)', 'Design Temp Min (°C)',
-                  'Length (mm)', 'Width/ID (mm)', 'Height (mm)', 'Material']
     for c in ['length', 'width', 'height', 'power_duty', 'power_abs', 'design_press',
               'design_temp_max', 'design_temp_min', 'wt_unit_dry', 'wt_unit_oper', 'wt_test']:
         if c + '_num' not in df.columns:
@@ -1785,88 +1945,106 @@ def package_page():
 
     with st.expander("Preview cleaned data"):
         st.dataframe(df[['package_clean', 'capacity_num', 'unit_clean', 'group_id', 'skid_no', 'n_skids',
-                         'cost_shared', 'unit_cost_num', 'package_cost', 'year_num'] + skid_cols[:2]],
+                         'cost_shared', 'unit_cost_num', 'package_cost', 'year_num', 'equip_no', 'description']],
                      use_container_width=True)
 
-    usable = df.dropna(subset=['package_clean', 'capacity_num', 'year_num'])
+    # The LIST PACKAGE sheet is the reference for the dropdown (package + its unit).
+    # If the sheet is missing, fall back to the packages/units found in the data.
+    try:
+        uploaded.seek(0)
+        pkg_list = load_package_list(uploaded)
+    except Exception:
+        pkg_list = (df.dropna(subset=['package_clean'])[['package_clean', 'unit_clean']]
+                    .rename(columns={'package_clean': 'package', 'unit_clean': 'unit'})
+                    .drop_duplicates().sort_values(['package', 'unit']).reset_index(drop=True))
+        st.warning(f"Sheet '{PACKAGE_LIST_SHEET}' not found — using the packages found in '{PACKAGE_SHEET_NAME}' instead.")
+
+    # When the list gives a package ONE unit, that unit is used for its database records
+    # (this also fixes records whose UNIT cell was typed wrongly, e.g. A-6800 "CHEMICAL INJECTION").
+    single_unit = pkg_list.groupby('package')['unit'].agg(lambda x: x.iloc[0] if x.nunique() == 1 else None).dropna()
+    df['unit_clean'] = [single_unit.get(pk, u) for pk, u in zip(df['package_clean'], df['unit_clean'])]
+    df['unit_key'] = df['unit_clean'].apply(_norm_unit)
+
+    # A package record is usable if its first skid has package, capacity and year
+    ok_groups = df[df['skid_no'] == 1].dropna(subset=['package_clean', 'capacity_num', 'year_num'])['group_id']
+    usable = df[df['group_id'].isin(ok_groups)]
     st.divider()
     st.subheader("Lookup specs & cost for a new package")
 
     with st.form("package_prediction_form"):
         st.markdown("**Search Parameters**")
-        c1, c2, c3 = st.columns(3)
+        pkg_options = {f"{p} ({u})": (p, u) for p, u in pkg_list.itertuples(index=False, name=None)}
+        c1, c2 = st.columns(2)
         with c1:
-            user_pkg = st.selectbox("List of Package", sorted(usable['package_clean'].unique()))
+            pkg_choice = st.selectbox("List of Package (Capacity Unit)", list(pkg_options.keys()))
         with c2:
-            user_capacity = st.number_input("Minimum Capacity", min_value=0.0, value=10.0, step=1.0)
-        with c3:
-            units = sorted(usable.loc[usable['package_clean'] == user_pkg, 'unit_clean'].unique())
-            user_unit = st.selectbox("Capacity Unit (only needed if the package has several)", [AUTO_OPTION] + units)
+            user_capacity = st.number_input("Required Capacity", min_value=0.0, value=10.0, step=1.0)
         submitted = st.form_submit_button("Lookup Existing Data", use_container_width=True, type="primary")
 
     if not submitted:
         return
 
-    m = usable[usable['package_clean'] == user_pkg]
-    if user_unit != AUTO_OPTION:
-        m = m[m['unit_clean'] == user_unit]
-    elif m['unit_clean'].nunique() > 1:
-        st.warning(f"'{user_pkg}' is stored in several capacity units ({', '.join(sorted(m['unit_clean'].unique()))}). "
-                   "Pick a unit above so capacities are compared like-for-like.")
-        st.stop()
-    m = m[m['capacity_num'] >= user_capacity]
+    user_pkg, user_unit = pkg_options[pkg_choice]
+    m = usable[(usable['package_clean'] == user_pkg) & (usable['unit_key'] == _norm_unit(user_unit))]
     if m.empty:
-        st.error(f"No historical '{user_pkg}' found with capacity ≥ {user_capacity:,.2f}.")
+        st.error(f"No historical '{user_pkg}' record with a capacity in {user_unit} exists in the database yet.")
         st.stop()
 
-    latest = m['year_num'].max()
-    m = m[m['year_num'] == latest]
-    groups = m.drop_duplicates('group_id').sort_values('capacity_num')['group_id'].tolist()
-    st.info(f"Package **{user_pkg}**, capacity ≥ **{user_capacity:,.2f}**, latest year **{int(latest)}**: "
-            f"**{len(groups)}** matching package record(s).")
+    ids, rec_id, status = select_package_references(m[m['skid_no'] == 1], user_capacity)
+    unit_lbl = user_unit
+    recs = {gid: m[m['group_id'] == gid].sort_values('skid_no') for gid in ids}
+    cap_of = lambda gid: recs[gid].iloc[0]['capacity_num']
+    eq_of = lambda gid: recs[gid].iloc[0]['equip_no']
 
-    for gid in groups:
-        g = m[m['group_id'] == gid].sort_values('skid_no')
-        head = g.iloc[0]
-        n = int(head['n_skids'])
-        title = f"{head['equip_no']} — {head['package_clean']} — {head['capacity_num']:g} {head['unit_clean']}"
-        st.markdown(f"### 🎯 {title}" + (f"  ·  {n} skids" if n > 1 else ""))
+    if status == 'exact':
+        st.success(f"Exact historical match found at **{cap_of(rec_id):,.2f} {unit_lbl}** (Equip No. {eq_of(rec_id)}).")
+    elif status == 'between':
+        lo, hi = ids
+        st.info(f"Requested capacity **{user_capacity:,.2f} {unit_lbl}** falls between historical capacities "
+                f"**{cap_of(lo):,.2f}** ({eq_of(lo)}) and **{cap_of(hi):,.2f}** ({eq_of(hi)}).")
+    elif status == 'below_all':
+        st.warning(f"Requested capacity **{user_capacity:,.2f} {unit_lbl}** is smaller than every historical record for "
+                   f"'{user_pkg}'. No smaller reference exists — recommending the closest bigger value.")
+    else:
+        st.warning(f"Requested capacity **{user_capacity:,.2f} {unit_lbl}** exceeds every historical record for "
+                   f"'{user_pkg}'. No bigger value is available — recommending the largest historical reference instead.")
+    if len(ids) < 2 and status != 'exact':
+        st.caption("Only 1 historical record exists for this package — showing the single available reference.")
 
-        out = g[skid_cols].copy()
-        out.columns = skid_heads
-        if n == 1:
-            qty = head['qty_num'] if pd.notna(head['qty_num']) else 1
-            unit_cost = head['package_cost']
-            out['Unit Cost (MYR)'] = g['unit_cost_num'].values
-            out['Total Cost (MYR)'] = g['unit_cost_num'].values * qty      # unit cost x quantity
-            st.dataframe(out.drop(columns=['Skid']), use_container_width=True, hide_index=True)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Unit Cost (MYR)", f"{unit_cost:,.2f}" if pd.notna(unit_cost) else "n/a")
-            k2.metric("Quantity", f"{qty:g}")
-            k3.metric("Total Cost (MYR)", f"{unit_cost * qty:,.2f}" if pd.notna(unit_cost) else "n/a")
-        else:
-            # Multi-skid package: quantity is per skid, so Total Cost (unit cost x qty) is NOT calculated
-            if head['cost_shared']:
-                out['Unit Cost (MYR)'] = ['shared (package total)'] + [''] * (n - 1)
-                cost_note = "One cost covers all skids (merged cell in Excel). Total cost by quantity is not applied to multi-skid packages."
-            else:
-                out['Unit Cost (MYR)'] = g['unit_cost_num'].values
-                cost_note = "Each skid has its own unit cost; package total is their sum. Total cost by quantity is not applied to multi-skid packages."
-            st.dataframe(out, use_container_width=True, hide_index=True)
-            st.caption(cost_note)
-            st.metric("Package Total Cost (MYR)",
-                      f"{head['package_cost']:,.2f}" if pd.notna(head['package_cost']) else "n/a")
+    labels = {gid: ("✅ Recommended (Bigger)" if gid == rec_id else "Reference") for gid in ids}
 
-        st.markdown("**⚖️ Unit Dry, Unit Operating & Test Weight (MT)**")
-        def fmt(v):
-            return f"{v:,.2f}" if pd.notna(v) else "n/a"
+    # Reference table: ALL database columns for each reference (one row per skid)
+    st.markdown("### 🎯 Reference Table")
+    st.caption("All columns of the database are shown.")
+    rows = []
+    for gid in ids:
+        g = recs[gid]
         for _, r in g.iterrows():
-            prefix = f"{r['equip_no']} — " if n > 1 else ""
-            w1, w2, w3 = st.columns(3)
-            w1.metric(f"{prefix}Unit Dry (MT)", fmt(r['wt_unit_dry_num']))
-            w2.metric(f"{prefix}Unit Operating (MT)", fmt(r['wt_unit_oper_num']))
-            w3.metric(f"{prefix}Test (MT)", fmt(r['wt_test_num']))
+            row = {'Match': labels[gid]}
+            if int(r['n_skids']) > 1:
+                row['Skid'] = str(int(r['skid_no']))
+            row.update(_db_values(r))
+            rows.append(row)
+        if int(g.iloc[0]['n_skids']) > 1:      # multi-skid: add the package total
+            t = _package_totals(g)
+            rows.append({'Match': labels[gid], 'Skid': 'Total', 'Equip No.': 'PACKAGE TOTAL',
+                         'Unit Dry (MT)': _disp(t['dry']), 'Unit Oper. (MT)': _disp(t['oper']),
+                         'Tot. Dry (MT)': _disp(_wsum(g, 'wt_tot_dry_num')),
+                         'Tot. Oper. (MT)': _disp(_wsum(g, 'wt_tot_oper_num')),
+                         'Test (MT)': _disp(t['test']),
+                         'Sub Total (MYR)': _disp(t['cost'], money=True)})
+    ref_df = pd.DataFrame(rows).fillna('')
+    st.dataframe(ref_df, use_container_width=True, hide_index=True)
+
+    # Key values (weights, dimensions, cost) for each reference
+    for gid in ids:
         st.divider()
+        _render_package_metrics(recs[gid], labels[gid])
+
+    st.divider()
+    st.success(f"**Recommendation:** Use the values from **{eq_of(rec_id)}** at **{cap_of(rec_id):,.2f} {unit_lbl}**"
+               + (" — the bigger of the two compared values." if len(ids) > 1 else "."))
+
 # =====================================================================
 # 8. NAVIGATION MENU
 # =====================================================================
